@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! The console command list's own methods.
 //!
 //! The console's ID3D12GraphicsCommandList keeps the PC methods (some moved:
@@ -259,6 +260,22 @@ struct Bindings {
     index_title: Option<(u64, u32, i32)>,
 }
 
+/// What the input assembler of `list` has from console code: the vertex buffers (slot → PC
+/// view), the index buffer (PC view) and the console topology – for a draw XCL fetches the
+/// vertices of itself (a GS pipeline in two passes).
+pub(super) fn ia_state(list: *mut c_void) -> (std::collections::BTreeMap<u32, D3D12_VERTEX_BUFFER_VIEW>, Option<D3D12_INDEX_BUFFER_VIEW>, Option<u32>) {
+    let g = LISTS.lock().unwrap();
+    match g.as_ref().and_then(|m| m.get(&(list as usize))) {
+        Some(s) => (s.bindings.vertex_buffers.clone(), s.index_buffer, s.bindings.topology),
+        None => Default::default(),
+    }
+}
+
+/// `pc_va` for other modules.
+pub(super) fn pc_va_of(va: u64) -> u64 {
+    pc_va(va)
+}
+
 /// `XCL_TRACE_FRAME`: the fixed-function state a list last set (topology, first viewport and
 /// scissor, render targets) as text.
 pub(super) fn state_summary(list: *mut c_void) -> String {
@@ -371,6 +388,20 @@ pub(super) fn bound_dsv(list: *mut c_void) -> Option<usize> {
     d
 }
 
+pub(super) unsafe fn render_target_resources(list: *mut c_void) -> Vec<usize> {
+    let mut rt = None;
+    with_bindings(list, |b| rt = b.render_targets.clone());
+    let Some(rt) = rt else { return Vec::new() };
+    let handles = if rt.single != 0 {
+        let Some(&base) = rt.handles.first() else { return Vec::new() };
+        let Some(dev) = device_of(list) else { return Vec::new() };
+        let step = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
+        (0..rt.num_targets as usize).map(|i| base + i * step).collect()
+    } else { rt.handles };
+    let mut resources: Vec<_> = handles.into_iter().filter_map(super::present::rtv_resource).collect();
+    resources.sort_unstable(); resources.dedup(); resources
+}
+
 /// depth-stencil views bound by draws that read a watched target: their clears are traced
 static WATCHED_DSVS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
@@ -395,8 +426,10 @@ const PC_OM_SET_RENDER_TARGETS: usize = 46;
 
 /// console #20 IASetPrimitiveTopology (PC #20)
 /// The console's rect list (AMD's DI_PT_RECTLIST, 0x11): three vertices of a rectangle, the
-/// fourth implied. The PC has no such topology; until a geometry shader expands them, each rect
-/// is drawn as the triangle of its three vertices (a retail game's full-screen passes).
+/// fourth implied. The PC has no such topology: the draw is a triangle list, and a translated
+/// pipeline of topology type 19 completes each rect in a geometry shader (`pso::rect_list_gs`);
+/// where it has none (refused, see `real::rect_list_gs`) each rect is drawn as the triangle of
+/// its three vertices (a retail game's full-screen passes).
 pub(super) const RECT_LIST: u32 = 17;
 
 pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32) {
@@ -412,7 +445,7 @@ pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32
             n
         };
         if new {
-            crate::xlog_warn!("D3D12.X: IASetPrimitiveTopology({t}) – a console topology the PC does not have{}", if t == RECT_LIST { ": rect lists are drawn as triangle lists (each rect's first half only)" } else { "" });
+            crate::xlog_warn!("D3D12.X: IASetPrimitiveTopology({t}) – a console topology the PC does not have{}", if t == RECT_LIST { ": rect lists are drawn as triangle lists, completed by a GS in rect list pipelines" } else { "" });
         }
     }
     let t = if t == RECT_LIST { windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 } else { t };
@@ -526,6 +559,11 @@ struct ListState {
     sparse_writes: Vec<(usize, usize)>,
     /// External memory waits recorded on this list
     pending_waits: Vec<PendingWait>,
+    /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
+    cpu_writes: Vec<super::cpu_writes::Write>,
+    /// Copies from GPU-only reservations backed by CPU memory outside UMA.
+    /// (title source, allocator-owned staging address, length); refreshed at submit.
+    cpu_view_copies: Vec<(usize, usize, usize)>,
     /// state a PC Reset clears (restored after KickoffX)
     bindings: Bindings,
 }
@@ -838,15 +876,16 @@ fn note_write(list: usize, va: u64, size: u64) {
 unsafe fn wait_all(waits: &[PendingWait]) {
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
     for w in waits {
-        if !w.wait_until_satisfied(WAIT_TIMEOUT) && once(&TIMEOUTS, 4) {
+        if !w.wait_until_satisfied(WAIT_TIMEOUT) && once(&TIMEOUTS, 40) {
             crate::xlog_warn!(
-                "D3D12.X: Wait{}BitValueX timed out after {} ms at {:#x} (op {}, want {:#x}, mask {:#x})",
+                "D3D12.X: Wait{}BitValueX timed out after {} ms at {:#x} (op {}, want {:#x}, mask {:#x}; memory holds {:x?})",
                 w.width * 8,
                 WAIT_TIMEOUT.as_millis(),
                 w.va,
                 w.comparison,
                 w.value,
-                w.mask
+                w.mask,
+                w.read_value()
             );
         }
     }
@@ -875,6 +914,16 @@ pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         super::sparse::readback_after_execute(q, &ranges);
     }
+}
+
+/// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`).
+pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void]) {
+    let writes: Vec<super::cpu_writes::Write> = {
+        let g = LISTS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return };
+        lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.cpu_writes.iter().cloned()).collect()
+    };
+    super::cpu_writes::after(queue, writes);
 }
 
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
@@ -924,8 +973,33 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     if size == 0 || !size.is_multiple_of(4) {
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
-    let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize)) else {
+    let Some((d, doff)) = real::uma_window_buffer(dst as usize, size as usize) else {
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
+    };
+    let source = real::uma_window_buffer(src as usize, size as usize).or_else(|| {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("XCL_COPY_CPU_VIEWS").is_some()) { return None; }
+        let end = (src as usize).checked_add(size as usize)?.checked_sub(1)?;
+        let cpu = crate::hle::kernelx::mirrors::source(src as usize)?;
+        if crate::hle::kernelx::mirrors::source(end)? != cpu.checked_add(size as usize - 1)? { return None; }
+        // Only the paired, CPU-filled source is staged. Other GPU memory remains unsupported.
+        if super::title_textures::mirror_source(src as usize) != cpu { return None; }
+        let upload = super::bind::allocate_upload_memory(this, size as usize, 16) as usize;
+        if upload == 0 { return None; }
+        let result = real::uma_window_buffer(upload, size as usize)?;
+        let bytes = super::title_textures::read_committed(cpu, size as usize);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), upload as *mut u8, bytes.len());
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default()
+            .cpu_view_copies.push((src as usize, upload, size as usize));
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: CopyMemoryToMemoryX stages CPU view {cpu:#x} of {src:#x}, {size:#x} bytes, refreshed at submit ({n} copies)");
+        }
+        Some(result)
+    });
+    let Some((s, soff)) = source else {
+        return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) has no GPU-readable source"));
     };
     if d == s && dst < src + size && src < dst + size {
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));
@@ -939,6 +1013,20 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     transition(this, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
     transition(this, s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
+
+/// Refresh allocator-owned staging before CPU dirty pages are uploaded and the lists run.
+pub(super) unsafe fn prepare_cpu_view_copies(lists: &[*mut c_void]) {
+    let copies: Vec<_> = {
+        let g = LISTS.lock().unwrap();
+        lists.iter().filter_map(|l| g.as_ref()?.get(&(*l as usize)))
+            .flat_map(|s| s.cpu_view_copies.iter().copied()).collect()
+    };
+    for (source, upload, size) in copies {
+        let cpu = super::title_textures::mirror_source(source);
+        let bytes = super::title_textures::read_committed(cpu, size);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), upload as *mut u8, size);
+    }
 }
 
 unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
@@ -1043,6 +1131,13 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         return warn(&N, what, format_args!("{va:#x} is not {n}-byte aligned"));
     }
     let (Some((d, _)), Some(at)) = (real::uma_window_buffer(va as usize, n as usize), real::uma_va_of(va as usize)) else {
+        // the title's own memory: written by the CPU once the GPU is there
+        if super::cpu_writes::writable(va as usize, n as usize) {
+            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+                s.cpu_writes.push((va as usize, words.to_vec()));
+                return;
+            }
+        }
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
     note_write(list as usize, va, n);
@@ -1115,8 +1210,9 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     if !va.is_multiple_of(n) {
         return warn(&N, what, format_args!("{va:#x} is not {n}-byte aligned"));
     }
-    if real::uma_window_buffer(va as usize, width as usize).is_none() {
-        return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
+    // (the wait reads the memory on the CPU: the title's own memory too, which `cpu_writes` fills)
+    if real::uma_window_buffer(va as usize, width as usize).is_none() && !crate::gpu::shader::readable(va as usize, width as usize) {
+        return warn(&N, what, format_args!("{va:#x} is not readable memory"));
     }
     if compare_u64(comparison, 0, 0).is_none() {
         return warn(&N, what, format_args!("unknown comparison op {comparison}"));
@@ -1140,9 +1236,13 @@ pub(super) unsafe extern "system" fn wait32_x(this: *mut c_void, va: u64, compar
     wait_memory(this, va, 4, comparison, value as u64, mask as u64, "Wait32BitValueX");
 }
 
-/// command list #72 Wait64BitValueX(address, comparison, value, mask, flags)
-pub(super) unsafe extern "system" fn wait64_x(this: *mut c_void, va: u64, comparison: u32, value: u64, mask: u64, _flags: u32) {
-    wait_memory(this, va, 8, comparison, value, mask, "Wait64BitValueX");
+/// command list #72 Wait64BitValueX(address, comparison, value, flags): the whole 64-bit value
+/// is compared. What comes after the value is not a mask: GTA VI passes a 32-bit 1 there (the
+/// upper half of the stack slot is whatever was left in it – 0x231_0000_0001), and read as a
+/// mask its waits for a counter at 2 ≥ 1, 4 ≥ 2 … never held: each timed out (2 s a frame, the
+/// game stood still after its first cinematic).
+pub(super) unsafe extern "system" fn wait64_x(this: *mut c_void, va: u64, comparison: u32, value: u64, _flags: u64, _more: u32) {
+    wait_memory(this, va, 8, comparison, value, u64::MAX, "Wait64BitValueX");
 }
 
 /// command list #88 Write32BitValueTopOfPipeX(address, value, flags)
@@ -1257,8 +1357,10 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         };
         let sparse_writes = s.clear_sparse_writes();
         s.written_ranges.clear();
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, active_query, waits, sparse_writes)
+        let cpu_writes = std::mem::take(&mut s.cpu_writes);
+        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, active_query, waits, (sparse_writes, cpu_writes))
     };
+    let (sparse_writes, cpu_writes) = sparse_writes;
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
@@ -1273,6 +1375,7 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let q_raw = queue as *mut c_void;
+    prepare_cpu_view_copies(&[this]);
     super::title_textures::refresh(q_raw);
     if !waits.is_empty() {
         wait_all(&waits);
@@ -1281,12 +1384,13 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
-    exec(q_raw, 1, one.as_ptr());
+    super::queue_order::submit_on(q_raw, || { exec(q_raw, 1, one.as_ptr()); super::resource_states::submitted(&one); });
     if !sparse_writes.is_empty() {
         if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
             super::sparse::readback_after_execute(q, &sparse_writes);
         }
     }
+    super::cpu_writes::after(q_raw, cpu_writes);
 
     let ext_closed = *(this as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
@@ -1305,6 +1409,7 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         s.native_bias = DepthBias::ZERO;
         s.using_fallback_pso = false;
         s.pso_dirty = false;
+        s.cpu_view_copies.clear();
     }
     let info = if bound_pso != 0 { device_x::base_depth_bias_info(bound_pso) } else { None };
     let mut applied_native = false;
@@ -1493,6 +1598,159 @@ fn pc_va(va: u64) -> u64 {
     real::uma_va_of(va as usize).unwrap_or(va)
 }
 
+/// `pc_va` for an index or vertex buffer of `bytes` bytes bound on `list`. A retail title also
+/// binds buffers in its ordinary memory (a private allocation outside the unified-memory
+/// windows – on the console the GPU reads all of the title's memory). The PC's GPU has no
+/// address for that (IASetIndexBuffer of it: debug layer message 725, then the device hangs,
+/// 0x887a0006), so the bytes are copied into the list's upload memory as they are at the bind;
+/// what the title writes there afterwards is not seen.
+///
+/// A buffer that stays bound (`mirror`) gets one block of unified memory for good – its
+/// *mirror*, the same for every bind of that address and size – and each draw copies the part
+/// it reads there first (`sync_title_buffers`), as the title wrote it by then. (A copy of the
+/// whole buffer at every bind filled unified memory within two minutes of a retail title's
+/// menus, and missed what the title wrote after the bind.)
+unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: bool) -> u64 {
+    let t = pc_va(va);
+    if t != va || va == 0 || bytes == 0 {
+        return t;
+    }
+    // in a window by number: a PC resource's GPU address
+    if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) || !crate::gpu::shader::readable(va as usize, bytes) {
+        return t;
+    }
+    if mirror {
+        if let Some(p) = mirror_of(va, bytes, what) {
+            return pc_va(p as u64);
+        }
+    }
+    let p = super::bind::allocate_upload_memory(list, bytes, 16);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if p.is_null() {
+        if n < 4 {
+            crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory and there is no room for a copy");
+        }
+        return t;
+    }
+    std::ptr::copy_nonoverlapping(va as *const u8, p, bytes);
+    if n < 4 || n.is_power_of_two() {
+        crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory – bound as a copy made now (#{n})");
+    }
+    pc_va(p as u64)
+}
+
+/// Ranges of the title's memory with a mirror in unified memory: (start, bytes, mirror). A
+/// title binds one buffer at many offsets (a ring it fills through the frame: a retail title's
+/// views all end at the buffer's end), so a mirror covers a 64 KiB-aligned range and a view
+/// inside a mirrored range uses that mirror at its offset.
+static MIRRORS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
+/// bytes of mirrors made (never freed)
+static MIRROR_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Where `[va, va + bytes)` is in a mirror, if it is in one.
+fn mirrored(va: u64, bytes: usize) -> Option<usize> {
+    MIRRORS.lock().unwrap().iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64).map(|&(s, _, m)| m + (va - s) as usize)
+}
+
+/// The mirror address of the title's buffer at `va`; its range's mirror is made (and filled
+/// once) the first time.
+unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
+    if let Some(p) = mirrored(va, bytes) {
+        return Some(p);
+    }
+    let mut g = MIRRORS.lock().unwrap();
+    if let Some(&(start, _, mirror)) = g.iter().find(|&&(start, len, _)| va >= start && va.checked_add(bytes as u64).is_some_and(|end| end <= start + len as u64)) { return Some(mirror + (va - start) as usize); }
+    let start = va & !0xffff;
+    let len = ((va + bytes as u64 + 0xffff) & !0xffff) - start;
+    // only as much as is the title's readable memory (the view itself is)
+    let (start, len) = if crate::gpu::shader::readable(start as usize, len as usize) { (start, len as usize) } else { (va, bytes) };
+    if MIRROR_BYTES.load(Ordering::Relaxed) + len as u64 > 2 << 30 {
+        return None;
+    }
+    let u = crate::gpu::uma::get()?;
+    let p = match u.has_sparse().then(|| super::sparse::alloc(len, 0x1_0000)).flatten() {
+        Some((p, _)) => p,
+        None => u.alloc(len, 0x1_0000)? as usize,
+    };
+    std::ptr::copy_nonoverlapping(start as *const u8, p as *mut u8, len);
+    g.push((start, len, p));
+    let total = MIRROR_BYTES.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
+    if g.len() <= 8 || g.len().is_power_of_two() {
+        crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory – {start:#x}..{:#x} mirrored at {p:#x}, each draw copies what it reads ({} mirrors, {} MB)", start + len as u64, g.len(), total >> 20);
+    }
+    Some(p + (va - start) as usize)
+}
+
+/// Before a draw on `list`: the parts of mirrored buffers it reads are copied from the title's
+/// memory. `indexed`: (first index, index count, base vertex); else `first_vertex`, `vertices`.
+pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32, u32, i32)>, first_vertex: u32, vertices: u32, instances: u32) {
+    if MIRROR_BYTES.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let (vbs, ib) = {
+        let g = LISTS.lock().unwrap();
+        let Some(b) = g.as_ref().and_then(|m| m.get(&(list as usize))).map(|s| &s.bindings) else { return };
+        (b.vertex_titles.values().copied().collect::<Vec<_>>(), b.index_title)
+    };
+    let mirrors: Vec<Option<usize>> = {
+        let mut v: Vec<Option<usize>> = vbs.iter().map(|&(va, bytes, _)| mirrored(va, bytes as usize)).collect();
+        v.push(ib.and_then(|(va, bytes, _)| mirrored(va, bytes as usize)));
+        if v.iter().all(Option::is_none) {
+            return;
+        }
+        v
+    };
+    let copy = |va: u64, mirror: usize, bytes: u32, from: u64, len: u64| {
+        let from = from.min(bytes as u64);
+        let len = len.min(bytes as u64 - from) as usize;
+        if len > 0 && crate::gpu::shader::readable(va as usize + from as usize, len) {
+            std::ptr::copy_nonoverlapping((va + from) as *const u8, (mirror + from as usize) as *mut u8, len);
+        }
+    };
+    // the vertices read: [lo, hi)
+    let (lo, hi) = match (indexed, ib) {
+        (Some((first, count, base)), Some((va, bytes, format))) => {
+            let size: u64 = if format == DXGI_FORMAT_R32_UINT.0 { 4 } else { 2 };
+            let (from, len) = (first as u64 * size, count as u64 * size);
+            if let Some(m) = mirrors[vbs.len()] {
+                copy(va, m, bytes, from, len);
+            }
+            let n = (len.min((bytes as u64).saturating_sub(from)) / size) as usize;
+            if n == 0 || !crate::gpu::shader::readable((va + from) as usize, n * size as usize) {
+                (0, u64::MAX)
+            } else {
+                let at = (va + from) as *const u8;
+                let (mut lo, mut hi) = (u32::MAX, 0u32);
+                for k in 0..n {
+                    let i = if size == 4 { at.add(4 * k).cast::<u32>().read_unaligned() } else { at.add(2 * k).cast::<u16>().read_unaligned() as u32 };
+                    // strip cut values are not vertices
+                    if i == u32::MAX || (size == 2 && i == 0xffff) {
+                        continue;
+                    }
+                    lo = lo.min(i);
+                    hi = hi.max(i);
+                }
+                if lo > hi {
+                    return;
+                }
+                ((lo as i64 + base as i64).max(0) as u64, (hi as i64 + base as i64 + 1).max(0) as u64)
+            }
+        }
+        (Some(_), None) => (0, u64::MAX),
+        (None, _) => (first_vertex as u64, first_vertex as u64 + vertices as u64),
+    };
+    for (k, &(va, bytes, stride)) in vbs.iter().enumerate() {
+        let Some(m) = mirrors[k] else { continue };
+        // a buffer stepped by instance is not told apart: with instances, all of it
+        if instances > 1 || hi == u64::MAX || stride == 0 {
+            copy(va, m, bytes, 0, bytes as u64);
+        } else {
+            copy(va, m, bytes, lo * stride as u64, (hi - lo) * stride as u64);
+        }
+    }
+}
+
 unsafe fn set_index_buffer(list: *mut c_void, view: Option<&D3D12_INDEX_BUFFER_VIEW>) {
     let f = pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_INDEX_BUFFER_VIEW)>(list, PC_IA_SET_INDEX_BUFFER);
     f(list, view.map_or(std::ptr::null(), |v| v as *const _));
@@ -1557,7 +1815,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
         .map(|k| {
             let mut v = views.add(k).read_unaligned();
             let title = v.BufferLocation;
-            v.BufferLocation = pc_va(v.BufferLocation);
+            v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "vertex buffer", true);
             if super::present::trace_frame() {
                 static N: AtomicU64 = AtomicU64::new(0);
                 let i = N.fetch_add(1, Ordering::Relaxed);
@@ -1603,9 +1861,9 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
     }
     let mut v = view.read_unaligned();
     s.bindings.index_title = Some((v.BufferLocation, v.SizeInBytes, v.Format.0));
-    v.BufferLocation = pc_va(v.BufferLocation);
-    s.index_buffer = Some(v);
     drop(g);
+    v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "index buffer", true);
+    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) { s.index_buffer = Some(v); }
     set_index_buffer(this, Some(&v));
 }
 
@@ -1625,7 +1883,8 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
         return;
     };
     let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
-    let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: pc_va(va), SizeInBytes: count.saturating_mul(stride), Format: format };
+    sync_title_buffers(this, None, 0, 0, 2);
+    let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: gpu_va(this, va, count.saturating_mul(stride) as usize, "DrawIndexedX indices", false), SizeInBytes: count.saturating_mul(stride), Format: format };
     set_index_buffer(this, Some(&view));
     super::bind::emit_prepared_indexed_draw(&list, count, 1, 0, 0, 0);
     set_index_buffer(this, bound.as_ref());
@@ -1674,6 +1933,8 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.written_ranges.clear();
         s.clear_sparse_writes();
         s.clear_waits();
+        s.cpu_writes.clear();
+        s.cpu_view_copies.clear();
         s.bindings = Bindings::default();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
@@ -1757,6 +2018,20 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             if (b[5] | b[6]) & BUFFER_ONLY_STATES != 0 && !is_buffer((b[2] as u64 | (b[3] as u64) << 32) as usize) {
                 b[5] &= !BUFFER_ONLY_STATES;
                 b[6] &= !BUFFER_ONLY_STATES;
+            }
+            super::resource_states::transition(this as usize, &b);
+            // Companion copies are commands, so issue earlier barriers before them.
+            if !out.is_empty() {
+                pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
+                out.clear();
+            }
+            match super::depth_uav::transition(this, &b) {
+                Ok(true) => continue,
+                Ok(false) => {},
+                Err(e) => {
+                    crate::xlog_error!("D3D12.X: depth transition cannot be represented safely: {e}");
+                    real::end_title(0x7c10008);
+                }
             }
             if b[5] == b[6] {
                 continue;
@@ -2910,4 +3185,83 @@ mod tests {
 
         on_release(list_ptr as usize);
     }
+}
+
+#[cfg(test)]
+mod title_buffer_mirror_gpu_tests {
+    use super::*;
+    use windows::core::Interface;
+    #[test]
+    fn gpu_memory_copy_from_cpu_view_observes_writes_after_recording() { unsafe {
+        use windows_sys::Win32::System::Memory as mem;
+        std::env::set_var("XCL_D3D12_DEBUG", "1");
+        std::env::set_var("XCL_COPY_CPU_VIEWS", "1");
+        super::super::real::init().unwrap();
+        let raw = super::super::real::device_raw();
+        let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
+        let info: ID3D12InfoQueue = dev.cast().unwrap(); info.ClearStoredMessages();
+        let reservation = 24usize << 30;
+        let cpu = crate::hle::kernelx::VirtualAlloc(std::ptr::null(), reservation, 0x2040_2000, mem::PAGE_READWRITE);
+        let gpu = crate::hle::kernelx::VirtualAlloc(std::ptr::null(), reservation, 0x2040_2000, 0x801);
+        assert!(!cpu.is_null() && !gpu.is_null());
+        assert!(!mem::VirtualAlloc(cpu, 65536, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+        let (destination, _) = super::super::sparse::alloc(65536, 65536).unwrap();
+        let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a, None).unwrap();
+        let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+        std::ptr::write_bytes(cpu, 0x11, 65536);
+        copy_memory_x(list.as_raw(), destination as u64, gpu as u64 + 128, 64, 0);
+        assert_eq!(LISTS.lock().unwrap().as_ref().unwrap().get(&(list.as_raw() as usize)).unwrap().cpu_view_copies.len(), 1);
+        // Negative control: a record-time snapshot would return 0x11, not these bytes.
+        let expected: Vec<u8> = (0..64u8).map(|n| n.wrapping_mul(3)).collect();
+        std::ptr::copy_nonoverlapping(expected.as_ptr(), (cpu as *mut u8).add(128), 64);
+        prepare_cpu_view_copies(&[list.as_raw()]);
+        super::super::title_textures::refresh(q.as_raw());
+        assert!(std::slice::from_raw_parts(destination as *const u8, 64).iter().all(|&b| b == 0));
+        list.Close().unwrap();
+        let cl: ID3D12CommandList = list.cast().unwrap();
+        let execute: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) = std::mem::transmute(super::super::real::orig_fn(q.as_raw(), 10));
+        super::super::queue_order::submit(|| execute(q.as_raw(), 1, [cl.as_raw()].as_ptr()));
+        readback_sparse_writes(q.as_raw(), &[list.as_raw()]);
+        assert_eq!(std::slice::from_raw_parts(destination as *const u8, 64), expected.as_slice(), "GPU copy must use the latest CPU source");
+        assert!(reset_x(list.as_raw(), a.as_raw() as usize, 0) >= 0);
+        assert!(LISTS.lock().unwrap().as_ref().unwrap().get(&(list.as_raw() as usize)).unwrap().cpu_view_copies.is_empty());
+        for i in 0..info.GetNumStoredMessagesAllowedByRetrievalFilter() {
+            let mut n = 0; info.GetMessage(i, None, &mut n).unwrap();
+            let mut data = vec![0u64; n.div_ceil(8)]; info.GetMessage(i, Some(data.as_mut_ptr().cast()), &mut n).unwrap();
+            let message = &*data.as_ptr().cast::<D3D12_MESSAGE>();
+            assert!(message.Severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0, "{}", std::ffi::CStr::from_ptr(message.pDescription.cast()).to_string_lossy());
+        }
+        crate::hle::kernelx::VirtualFree(cpu, 0, mem::MEM_RELEASE);
+        crate::hle::kernelx::VirtualFree(gpu, 0, mem::MEM_RELEASE);
+        super::super::sparse::free(destination);
+        println!("GPU copied the paired CPU view, including a post-record write; reset cleared staging metadata; no validation errors");
+    }}
+    #[test]
+    fn mirrored_indices_changed_after_binding_reach_the_gpu(){unsafe{
+        std::env::set_var("XCL_D3D12_DEBUG","1");
+        super::super::real::init().unwrap();
+        let raw=super::super::real::device_raw();let dev=ID3D12Device::from_raw_borrowed(&raw).unwrap();let info:ID3D12InfoQueue=dev.cast().unwrap();info.ClearStoredMessages();
+        let a:ID3D12CommandAllocator=dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list:ID3D12GraphicsCommandList=dev.CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,&a,None).unwrap();
+        let mut indices=vec![0u32,1,2,3,4,5];let address=indices.as_ptr()as u64;
+        let gpu=gpu_va(list.as_raw(),address,24,"test index buffer",true);let m=mirrored(address,24).unwrap();assert_ne!(gpu,address);assert_eq!(gpu,super::super::real::uma_va_of(m).unwrap());
+        let offset=gpu_va(list.as_raw(),address+4,20,"test offset view",true);assert_eq!(offset,gpu+4);
+        with_bindings(list.as_raw(),|b|b.index_title=Some((address,24,DXGI_FORMAT_R32_UINT.0)));
+        indices[1]=0x1234abcd;
+        sync_title_buffers(list.as_raw(),Some((0,6,0)),0,0,1);
+        assert_eq!(std::slice::from_raw_parts(m as *const u32,6),indices.as_slice());
+        let q:ID3D12CommandQueue=dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+        let pages=[m&!0xfff];super::super::sparse::before_execute(&q,&pages,4096);
+        let (source,off)=super::super::real::uma_window_buffer(m,24).unwrap();let source=source as *mut c_void;let source=ID3D12Resource::from_raw_borrowed(&source).unwrap();
+        let d=D3D12_RESOURCE_DESC{Dimension:D3D12_RESOURCE_DIMENSION_BUFFER,Width:256,Height:1,DepthOrArraySize:1,MipLevels:1,SampleDesc:windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC{Count:1,Quality:0},Layout:D3D12_TEXTURE_LAYOUT_ROW_MAJOR,..Default::default()};
+        let f:unsafe extern "system" fn(*mut c_void,*const D3D12_HEAP_PROPERTIES,D3D12_HEAP_FLAGS,*const D3D12_RESOURCE_DESC,D3D12_RESOURCE_STATES,*const D3D12_CLEAR_VALUE,*const windows::core::GUID,*mut *mut c_void)->i32=std::mem::transmute(super::super::real::orig_fn(raw,27));
+        let mut rb=std::ptr::null_mut();assert!(f(raw,&D3D12_HEAP_PROPERTIES{Type:D3D12_HEAP_TYPE_READBACK,..Default::default()},D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_COPY_DEST,std::ptr::null(),&ID3D12Resource::IID,&mut rb)>=0);let rb=ID3D12Resource::from_raw(rb);
+        let copy:unsafe extern "system" fn(*mut c_void,*mut c_void,u64,*mut c_void,u64,u64)=std::mem::transmute(super::super::real::orig_fn(list.as_raw(),15));copy(list.as_raw(),rb.as_raw(),0,source.as_raw(),off,24);list.Close().unwrap();
+        let execute:unsafe extern "system" fn(*mut c_void,u32,*const *mut c_void)=std::mem::transmute(super::super::real::orig_fn(q.as_raw(),10));let cl:ID3D12CommandList=list.cast().unwrap();super::super::queue_order::submit(||execute(q.as_raw(),1,[cl.as_raw()].as_ptr()));
+        let fence:ID3D12Fence=dev.CreateFence(0,D3D12_FENCE_FLAG_NONE).unwrap();super::super::queue_order::signal(&q,&fence,1).unwrap();let start=std::time::Instant::now();while fence.GetCompletedValue()<1{assert!(start.elapsed().as_secs()<10);std::thread::sleep(std::time::Duration::from_millis(1));}dev.GetDeviceRemovedReason().unwrap();
+        let mut p=std::ptr::null_mut();rb.Map(0,None,Some(&mut p)).unwrap();assert_eq!(std::slice::from_raw_parts(p.cast::<u32>(),6),indices.as_slice());rb.Unmap(0,None);
+        for i in 0..info.GetNumStoredMessagesAllowedByRetrievalFilter(){let mut n=0;info.GetMessage(i,None,&mut n).unwrap();let mut data=vec![0u64;n.div_ceil(8)];info.GetMessage(i,Some(data.as_mut_ptr().cast()),&mut n).unwrap();let message=&*data.as_ptr().cast::<D3D12_MESSAGE>();assert!(message.Severity.0>D3D12_MESSAGE_SEVERITY_ERROR.0,"{}",std::ffi::CStr::from_ptr(message.pDescription.cast()).to_string_lossy());}
+        println!("CPU index buffer mirrored with shared offsets; post-bind modification visible in all GPU readback words; no validation errors");
+    }}
 }

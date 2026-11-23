@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! Instruction semantics checked on the real GPU: small RDNA2 programs are assembled,
 //! recompiled to HLSL, compiled with DXC and run as kernels. Skipped (with a note) when
 //! there is no D3D12 GPU with SM 6.6 + wave64 or no DXC. Tests that use `gpu_waves` also run
@@ -1634,6 +1635,168 @@ fn gpu_graphics_vs_ps_draw() {
             let got = px[y * 16 + x];
             assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "pixel ({x},{y}) = {got:?}, expected {want:?}");
         }
+    }
+}
+
+/// `emit::rect_list_gs` refuses integer (flat) outputs and declares the VS's output struct.
+#[test]
+fn rect_list_gs_outputs() {
+    let float = [el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 0, 0, 3, 1, 0xF), el("SV_ClipDistance", 0, 2, 3, 2, 1)];
+    let h = super::emit::rect_list_gs(&float).unwrap();
+    assert!(h.contains("triangle XclOut v[3]") && h.contains("d.p0 = a.p0 + b.p0 - k.p0;") && h.contains("d.p1 = a.p1 + b.p1 - k.p1;"), "{h}");
+    let flat = [el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 0, 0, 1, 1, 0xF)];
+    assert!(super::emit::rect_list_gs(&flat).unwrap_err().contains("TEXCOORD0"));
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&h, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{h}"));
+    }
+}
+
+/// A PS with `v_interp_mov_f32` reads flat (`pso::reads_flat`): its rect list keeps no GS.
+#[test]
+fn rect_list_ps_reads_flat() {
+    let mov = prog(&[
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 2), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+    ]);
+    let p2 = prog(&[
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+    ]);
+    assert!(super::pso::reads_flat(&mov).unwrap());
+    assert!(!super::pso::reads_flat(&p2).unwrap());
+}
+
+/// `emit::rect_list_gs` on the full-screen pass a downstream build (theaustinayers/xcl, build 5,
+/// via #189) reports from a retail title: positions (−1,1) (−1,−1) (1,−1), texture coordinates
+/// (0,0) (0,1) (1,1), the shared corner v1 and the implied one (1,1) with (1,0). Plain HLSL
+/// VS/PS around the GS. Every pixel must be drawn with its texture coordinate, for w 1 and 2;
+/// without the GS about half are. The other half of that rect as a triangle (v0, v2 and the
+/// implied corner – what a draw expanded to two triangles a rect on the CPU sends next) is three
+/// corners of the same rect, so the GS completes it to the whole rect as well: such a draw must
+/// not also get this GS, or each rect is drawn twice.
+#[test]
+fn gpu_rect_list_fullscreen_order() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let outputs = [el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 0, 0, 3, 1, 0xF)];
+    let vs_hlsl = "struct V { float4 pos : SV_Position; float4 uv : TEXCOORD0; };\nV main(float4 pos : POSITION, float4 uv : TEXCOORD0) { V o; o.pos = pos; o.uv = uv; return o; }\n";
+    let ps_hlsl = "float4 main(float4 pos : SV_Position, float4 uv : TEXCOORD0) : SV_Target { return uv; }\n";
+    let vs = super::dxc::compile(vs_hlsl, "main", "vs_6_6", &[]).unwrap();
+    let ps = super::dxc::compile(ps_hlsl, "main", "ps_6_6", &[]).unwrap();
+    let gs_hlsl = super::emit::rect_list_gs(&outputs).unwrap();
+    let gs = super::dxc::compile(&gs_hlsl, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{gs_hlsl}"));
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "TEXCOORD", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 16 },
+    ];
+    let (n, clear) = (16usize, [0.0f32, 0.0, 1.0, 0.5]);
+    let first = [([-1.0f32, 1.0], [0.0f32, 0.0]), ([-1.0, -1.0], [0.0, 1.0]), ([1.0, -1.0], [1.0, 1.0])];
+    let second = [([-1.0f32, 1.0], [0.0f32, 0.0]), ([1.0, -1.0], [1.0, 1.0]), ([1.0, 1.0], [1.0, 0.0])];
+    for (name, corners, w) in [("v0 v1 v2", first, 1.0f32), ("v0 v1 v2", first, 2.0), ("v0 v2 v3", second, 1.0)] {
+        let v: Vec<f32> = corners.iter().flat_map(|&([x, y], [s, t])| [x * w, y * w, 0.0, w, s, t, 0.0, 1.0]).collect();
+        let run = |with_gs: bool| runner::draw_gs(&vs, with_gs.then_some(gs.as_slice()), &ps, &layout, &v, 32, &[], &[], n as u32, clear).unwrap();
+        let px = run(true);
+        for y in 0..n {
+            for x in 0..n {
+                let want = [(x as f32 + 0.5) / n as f32, (y as f32 + 0.5) / n as f32, 0.0, 1.0];
+                let got = px[y * n + x];
+                assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "{name}, w {w}: pixel ({x},{y}) = {got:?}, expected {want:?}");
+            }
+        }
+        // the negative control: the three vertices alone draw half the rect
+        let drawn = run(false).iter().filter(|p| **p != clear).count();
+        assert!(drawn > n * n / 3 && drawn < n * n * 2 / 3, "{name}, w {w}: without the GS {drawn} of {} pixels drawn", n * n);
+    }
+}
+
+/// Console rect lists (DI_PT_RECTLIST) drawn through `emit::rect_list_gs`: three corners of a
+/// screen-aligned rectangle, the corner between the other two at v0 (Mesa radeonsi's blits),
+/// v1 (xf86-video-ati's r600 EXA) or v2. Each covers the whole rectangle and its attribute – the
+/// vertex's own position – is the pixel's position everywhere, the implied corner's quarter
+/// included (both drivers' texture coordinates depend on it). Without the GS (as before) part
+/// of the rectangle stays clear; three vertices that are not such corners, or differ in w, draw
+/// the same with and without it. Synthetic: the expected images are the rectangle and the
+/// triangle, not a measurement of the hardware.
+#[test]
+fn gpu_rect_list_corners() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{PsInterface, VsInterface};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let vs_code = prog(&[
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+    ]);
+    let vsi = VsInterface {
+        inputs: vec![el("POSITION", 0, 0, 3, 0, 0xF), el("COLOR", 0, 0, 3, 1, 0xF)],
+        outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("COLOR", 0, 0, 3, 1, 0xF)],
+        attr_base: 4,
+        params: None,
+    };
+    let mut ps_ops: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = Vec::new();
+    for c in 0..2u64 {
+        ps_ops.push(("V_INTERP_P1_F32", "ENC_VINTRP", vec![("VDST", 4 + c), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", c)], None));
+        ps_ops.push(("V_INTERP_P2_F32", "ENC_VINTRP", vec![("VDST", 4 + c), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", c)], None));
+    }
+    ps_ops.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 6), ("SRC0", 128)], None));
+    ps_ops.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 7), ("SRC0", 242)], None));
+    ps_ops.push(("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None));
+    let ps_list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = ps_ops.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect();
+    let ps_code = prog(&ps_list);
+    let psi = PsInterface {
+        inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("COLOR", 0, 0, 3, 1, 0xF)],
+        outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
+        input_ena: 0x302,
+        attrs: None,
+    };
+    let outputs = vsi.outputs.clone();
+    let vt = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
+    let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
+    assert!(vt.complete() && pt.complete(), "{:?} {:?}", vt.unsupported, pt.unsupported);
+    let vs = super::dxc::compile(&vt.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", vt.hlsl));
+    let ps = super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+    let gs_hlsl = super::emit::rect_list_gs(&outputs).unwrap();
+    let gs = super::dxc::compile(&gs_hlsl, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{gs_hlsl}"));
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 16 },
+    ];
+    // a vertex at NDC (x, y) with clip w: position (x·w, y·w, 0, w), COLOR (x, y, 0, 1)
+    let verts = |ps: &[[f32; 3]]| -> Vec<f32> { ps.iter().flat_map(|&[x, y, w]| [x * w, y * w, 0.0, w, x, y, 0.0, 1.0]).collect() };
+    let (n, clear) = (16usize, [0.0f32, 0.0, 1.0, 0.5]);
+    let ndc = |x: usize, y: usize| ((x as f32 + 0.5) / 8.0 - 1.0, 1.0 - (y as f32 + 0.5) / 8.0);
+    let run = |v: &[f32], with_gs: bool| runner::draw_gs(&vs, with_gs.then_some(gs.as_slice()), &ps, &layout, v, 32, &[], &[], n as u32, clear).unwrap();
+    let (x1, x2, y1, y2) = (-0.5f32, 0.5, -0.5, 0.5);
+    for (name, corners) in [
+        ("corner v0 (radeonsi)", [[x1, y1], [x1, y2], [x2, y1]]),
+        ("corner v1 (r600 EXA)", [[x1, y1], [x1, y2], [x2, y2]]),
+        ("corner v2", [[x1, y2], [x2, y1], [x1, y1]]),
+    ] {
+        let v = verts(&corners.map(|[x, y]| [x, y, 1.0]));
+        let px = run(&v, true);
+        for y in 0..n {
+            for x in 0..n {
+                let (fx, fy) = ndc(x, y);
+                let want = if fx > x1 && fx < x2 && fy > y1 && fy < y2 { [fx, fy, 0.0, 1.0] } else { clear };
+                let got = px[y * n + x];
+                assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "{name}: pixel ({x},{y}) = {got:?}, expected {want:?}");
+            }
+        }
+        // the negative control: as a triangle list only part of the rectangle is drawn
+        let tri = run(&v, false);
+        let missing = (0..n * n).filter(|&i| px[i] != clear && tri[i] == clear).count();
+        assert!(missing >= 16, "{name}: without the GS {missing} of the rectangle's pixels stay clear");
+    }
+    // left as the triangle they make: not three rectangle corners, and corners with unequal w
+    for (name, v) in [
+        ("not a rectangle", verts(&[[-0.5, -0.5, 1.0], [0.25, 0.5, 1.0], [0.5, -0.25, 1.0]])),
+        ("unequal w", verts(&[[x1, y1, 1.0], [x1, y2, 2.0], [x2, y1, 1.0]])),
+    ] {
+        let (with, without) = (run(&v, true), run(&v, false));
+        assert!(without.iter().any(|p| *p != clear), "{name}: the triangle draws");
+        assert!(with.iter().zip(&without).all(|(a, b)| a.iter().zip(b).all(|(p, q)| (p - q).abs() < 1e-5)), "{name}: the GS changed the image");
     }
 }
 
@@ -6617,6 +6780,29 @@ fn gpu_cmp_class_f16_preserves_snan() {
         assert_eq!((r.sgpr[8], r.sgpr[9]), all, "wave{lanes} f16 abs(-1.0) matches +normal");
         assert_eq!((r.sgpr[10], r.sgpr[11]), all, "wave{lanes} f16 neg(-1.0) matches +normal");
     }
+}
+
+#[test]
+fn fspx_compute_user_sgprs_from_rsrc2() {
+    use crate::gpu::xbox::tests::container;
+
+    let counts = [4u32, 8].map(|count| {
+        // Two directory entries: type 0 holds the compute registers, type 6 holds the code.
+        let mut part = Vec::from(*b"FSPX");
+        for word in [1u32, 2, 0x74, 0, 0x30, 0x1c, 0, 6, 0x4c, 0x28, 0] {
+            part.extend_from_slice(&word.to_le_bytes());
+        }
+        part.resize(0x74, 0);
+        let header = &mut part[0x30..0x4c];
+        header[0x0c..0x12].copy_from_slice(&[1, 0, 1, 0, 1, 0]); // numthreads(1, 1, 1)
+        let rsrc2 = (count << 1) | 0x81; // set unrelated bits on both sides of USER_SGPR
+        header[0x18..0x1c].copy_from_slice(&rsrc2.to_le_bytes());
+        part[0x70..].copy_from_slice(&0xbf81_0000u32.to_le_bytes()); // s_endpgm
+        let blob = container(&[(b"ACCC", &part)]);
+        assert_eq!(super::pso::fspx(&blob).unwrap().rsrc2, rsrc2);
+        super::pso::compute_user_sgprs(&blob)
+    });
+    assert_eq!(counts, [Some(4), Some(8)]);
 }
 
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –

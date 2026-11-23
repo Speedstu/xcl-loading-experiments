@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! The host process: started by the launcher with the game's command line. Sets up
 //! logging, the VFS, hooks and HLE, maps the title and jumps to its entry point.
 
@@ -29,6 +30,25 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    // Opt-in diagnostic stop before this experimental host exhausts system commit.
+    // This only ends the title process; it does not change Windows memory settings.
+    if let Some(mb) = std::env::var("XCL_MIN_FREE_COMMIT_MB").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&v| v > 0 && v <= 65536) {
+        let _ = std::thread::Builder::new().name("xcl-memory-guard".into()).spawn(move || {
+            use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+                m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+                if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 && m.ullAvailPageFile / (1 << 20) < mb {
+                    let reason = format!("diagnostic memory guard: {} MiB system commit free (minimum {mb} MiB); ending this test", m.ullAvailPageFile / (1 << 20));
+                    crate::xlog_warn!("{reason}");
+                    crate::report::write_final(Some(reason));
+                    crate::log::flush();
+                    crate::hle::d3d12x::real::end_title(0x7c10006);
+                }
+            }
+        });
+    }
     // `XCL_ACTIVITY=1`: every 2 s what the title did since (a timeline of where it stops)
     if std::env::var_os("XCL_ACTIVITY").is_some() {
         let _ = std::thread::Builder::new().name("xcl-activity".into()).spawn(|| {
@@ -70,7 +90,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
     if let Some(secs) = std::env::var("XCL_RUN_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(secs));
-            crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title ({} frames shown)", crate::hle::d3d12x::present::presents());
+            let (shown, presented) = crate::hle::d3d12x::present::counters();
+            crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title ({shown} frames shown, {presented} PresentX calls)");
             crate::report::write_final(None);
             crate::log::flush();
             crate::hle::d3d12x::real::end_title(0);

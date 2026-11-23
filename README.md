@@ -1,5 +1,9 @@
 # XCL – Xbox Series X|S → Windows compatibility layer
 
+> **Experimental branch:** [Build and try the local loading experiment](LOADING-TRIAL.md).
+> Startup/loading reached in local tests; gameplay remains unverified. The upstream README below is retained
+> for build documentation and is not a list of games retested on this branch.
+
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/yB5tstRHrn)
 **Discord: <https://discord.gg/yB5tstRHrn>**
 

@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! Exception-handling support for manually mapped images.
 //!
 //! * `.pdata` is registered with `RtlAddFunctionTable` so the unwinder finds our frames.
@@ -101,6 +102,11 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
+        if !ctx.is_null() {
+            let mut context = std::ptr::read(ctx);
+            let frames: Vec<String> = unwind(&mut context, 32).into_iter().map(modules::describe_address).collect();
+            crate::xlog_error!("faulting thread unwound: {}", frames.join(" < "));
+        }
         crate::report::write_final(Some(msg));
         crate::log::flush();
     }
@@ -141,7 +147,48 @@ pub fn install_crash_handler() {
         SetUnhandledExceptionFilter(Some(unhandled_filter));
         install_invalid_parameter_handler();
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
+        if std::env::var_os("XCL_RESOURCE_FAULT_PROBE").is_some() {
+            windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(1, Some(resource_fault_probe));
+        }
     }
+}
+
+/// A diagnostic of the observed geometry-source crash. It never skips the fault:
+/// record the CPU object and its GPU view, then end this already-failing trial.
+unsafe extern "system" fn resource_fault_probe(info: *mut EXCEPTION_POINTERS) -> i32 {
+    static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if info.is_null() || (*info).ExceptionRecord.is_null() || (*info).ContextRecord.is_null() { return 0; }
+    let rec = &*(*info).ExceptionRecord;
+    let ctx = &*(*info).ContextRecord;
+    if rec.ExceptionCode as u32 != 0xc0000005 { return 0; }
+    let Some(m) = modules::main_module() else { return 0 };
+    let rva = ctx.Rip.saturating_sub(m.base as u64);
+    if !matches!(rva, 0x4fb3588 | 0x5760cb) || SEEN.swap(true, Ordering::AcqRel) { return 0; }
+    let capture = |label: &str, at: u64| {
+        let mut bytes = [0u8; 96]; let mut n = 0usize;
+        windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(), at as *const c_void,
+            bytes.as_mut_ptr() as *mut c_void, bytes.len(), &mut n);
+        crate::xlog_error!("resource fault {label} at {at:#x}: {} bytes {:02x?}", n, &bytes[..n.min(bytes.len())]);
+    };
+    let object = if rva == 0x5760cb { ctx.Rdi } else { ctx.R13 };
+    let companion = if rva == 0x5760cb { ctx.R15 } else { ctx.R14 };
+    let reason = format!("resource source fault at +{rva:#x}: object={object:#x} companion={companion:#x} source={:#x} count={:#x}", ctx.Rdx, ctx.R8);
+    crate::xlog_error!("{reason}");
+    capture("CPU object", object); capture("CPU companion", companion);
+    let mut copy = std::ptr::read(ctx);
+    let frames: Vec<_> = unwind(&mut copy, 24).into_iter().map(modules::describe_address).collect();
+    crate::xlog_error!("resource fault callers: {}", frames.join(" < "));
+    crate::log::flush();
+    for (label, at) in [("GPU object", object), ("GPU companion", companion)] {
+        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at as usize)) {
+            crate::hle::d3d12x::sparse::readback_now(at as usize, 96);
+            capture(label, at);
+        }
+    }
+    crate::report::write_final(Some(reason));
+    crate::log::flush();
+    crate::hle::d3d12x::real::end_title(0x7c1000c)
 }
 
 /// MSVC's x64 `__security_check_cookie` (vcruntime): `cmp rcx, [__security_cookie]; jne fail;
@@ -333,6 +380,15 @@ unsafe fn stack_callers(rsp: usize) -> String {
     stack_callers_n(rsp, 6)
 }
 
+/// A synchronous native validation callback's actual call chain, not stale stack words.
+pub(crate) unsafe fn current_callers(max: usize) -> String {
+    #[repr(align(16))]
+    struct Aligned(windows_sys::Win32::System::Diagnostics::Debug::CONTEXT);
+    let mut context:Aligned = std::mem::zeroed();
+    windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureContext(&mut context.0);
+    unwind(&mut context.0,max).into_iter().map(modules::describe_address).collect::<Vec<_>>().join(" < ")
+}
+
 /// `stack_callers` with up to `max` callers.
 unsafe fn stack_callers_n(rsp: usize, max: usize) -> String {
     let mut callers = Vec::new();
@@ -476,6 +532,7 @@ pub fn dump_threads() {
 
 static WATCHED: AtomicUsize = AtomicUsize::new(0);
 static WATCH_HITS: AtomicUsize = AtomicUsize::new(0);
+static WATCH_VALUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// the exception `watch_writes` raises: the handler arms the raising thread at once
 const WATCH_ARM: u32 = 0xE0C1_A7E1;
@@ -496,17 +553,20 @@ unsafe extern "system" fn watch_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return 0; // EXCEPTION_CONTINUE_SEARCH
     }
     ctx.Dr6 = 0;
-    if WATCH_HITS.fetch_add(1, Ordering::Relaxed) < 32 {
+    let last_error = windows_sys::Win32::Foundation::GetLastError();
+    let value = (addr as *const u64).read_volatile();
+    if WATCH_VALUE.swap(value, Ordering::Relaxed) != value && WATCH_HITS.fetch_add(1, Ordering::Relaxed) < 128 {
         let callers = stack_callers(ctx.Rsp as usize);
         crate::xlog_warn!(
             "watch: {:#x} now {:#x}, written by the instruction before {} (thread {}); on the stack: {}",
             addr,
-            (addr as *const u64).read_volatile(),
+            value,
             modules::describe_address(ctx.Rip as usize),
             windows_sys::Win32::System::Threading::GetCurrentThreadId(),
             callers
         );
     }
+    windows_sys::Win32::Foundation::SetLastError(last_error);
     -1 // EXCEPTION_CONTINUE_EXECUTION
 }
 
@@ -517,7 +577,7 @@ pub fn watch_writes(addr: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, GetThreadContext, SetThreadContext, CONTEXT, CONTEXT_DEBUG_REGISTERS_AMD64};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
     use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME};
-    if WATCHED.swap(addr, Ordering::AcqRel) != 0 {
+    if WATCHED.compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return;
     }
     unsafe {
@@ -669,6 +729,9 @@ unsafe extern "system" fn probe_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 /// stack arguments 5 and 6, the bytes at rcx and r8) and the title goes on – which of the
 /// title's code runs, with what, without changing it.
 pub fn start_probes() {
+    if let Some(addr) = std::env::var("XCL_WATCH_ADDRESS").ok().and_then(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()) {
+        watch_writes(addr);
+    }
     // `XCL_WATCH=rva` (hex, in the title's exe): every write to those 8 bytes is logged with
     // the writing code (`watch_writes`) – who fills a field the title later trips over
     if let Some(rva) = std::env::var("XCL_WATCH").ok().and_then(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()) {

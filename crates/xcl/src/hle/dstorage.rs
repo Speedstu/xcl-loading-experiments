@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! `xcrdapi.dll` – the console's DirectStorage: `DStorageGetFactory` → IDStorageFactoryX.
 //!
 //! The interfaces are the PC DirectStorage ones in the console's vtable order and structure
@@ -284,6 +285,12 @@ unsafe extern "system" fn factory_open_file(_p: *mut c_void, path: *const u16, r
             return e.raw_os_error().map_or(E_INVALIDARG, |c| (0x8007_0000u32 | (c as u32 & 0xFFFF)) as i32);
         }
     };
+    if std::env::var_os("XCL_TRACE_STORAGE").is_some() {
+        let mut path = vec![0u16; 32768];
+        let n = windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW(file.as_raw_handle(), path.as_mut_ptr(), path.len() as u32, 0);
+        let host = if n != 0 && (n as usize) < path.len() { String::from_utf16_lossy(&path[..n as usize]) } else { "unknown".into() };
+        crate::xlog_info!("DirectStorage: opened {name} -> {host}");
+    }
     let inner = Arc::new(FileInner { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), path: name.encode_utf16().collect(), file: Mutex::new(Some(Arc::new(file))) });
     let o = new_object(file_vtbl(), inner);
     let hr = file_qi(o, riid, out);
@@ -600,7 +607,15 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     } else {
         let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
         let mut b = vec![0u8; r.source_size as usize];
+        let started = std::time::Instant::now();
         read_exact_at(&f, r.offset, &mut b)?;
+        if std::env::var_os("XCL_TRACE_STORAGE").is_some() && started.elapsed().as_millis() > 250 {
+            static SLOW: AtomicU32 = AtomicU32::new(0);
+            if SLOW.fetch_add(1, Ordering::Relaxed) < 24 {
+                let name = file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default();
+                crate::xlog_info!("DirectStorage: slow read {} ms, {} bytes at {:#x}: {name}", started.elapsed().as_millis(), b.len(), r.offset);
+            }
+        }
         b
     };
 
@@ -713,7 +728,20 @@ struct QueueInner {
 }
 
 impl QueueInner {
-    fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>) {
+    fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>, stage: &str) {
+        // Enqueue warnings alone hid failures during execution (including invalid page
+        // arrays). Keep a bounded count per HRESULT so a refused codec cannot hide them.
+        static COUNTS: OnceLock<Mutex<std::collections::HashMap<HRESULT, u64>>> = OnceLock::new();
+        let last = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        let n = {
+            let mut counts = COUNTS.get_or_init(|| Mutex::new(std::collections::HashMap::new())).lock().unwrap();
+            let n = counts.entry(hr).or_default(); *n += 1; *n
+        };
+        if n <= 4 || n.is_power_of_two() {
+            let name = file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default();
+            crate::xlog_warn!("DirectStorage: {stage} failed {hr:#x} ({n} of this code): options {:#x}, destination {:#x}, {} bytes, source offset {:#x}, {} bytes: {name}", request.options, request.destination, request.destination_size, request.offset, request.source_size);
+        }
+        unsafe { windows_sys::Win32::Foundation::SetLastError(last) };
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
         if e.1.is_none() {
@@ -790,14 +818,14 @@ impl QueueInner {
                             continue;
                         }
                         if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
-                            self.fail(hr, req, file.as_deref());
+                            self.fail(hr, req, file.as_deref(), "execution");
                             if since_status >= 0 {
                                 since_status = hr;
                             }
                         }
                     }
                     Entry::Refused { hr, req, file } => {
-                        self.fail(hr, req, file.as_deref());
+                        self.fail(hr, req, file.as_deref(), "enqueue");
                         if since_status >= 0 {
                             since_status = hr;
                         }

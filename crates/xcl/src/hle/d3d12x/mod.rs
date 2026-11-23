@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! d3d12_xs.dll – D3D12.X.
 //!
 //! Backends:
@@ -14,6 +15,11 @@ pub mod console_heap;
 pub mod console_list;
 pub mod device_x;
 pub mod dxgi_device;
+mod cpu_writes;
+pub(crate) mod queue_order;
+mod depth_uav;
+mod resource_states;
+mod deferred_pso;
 mod fence_x;
 pub mod frame;
 pub mod guard;
@@ -26,7 +32,11 @@ pub mod real;
 pub mod sparse;
 pub mod title_list;
 pub mod title_textures;
+mod texture_tiles;
+mod texture_residency;
 pub mod vram;
+#[cfg(test)]
+mod two_pass_tests;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;

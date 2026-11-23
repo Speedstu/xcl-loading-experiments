@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! Textures a title places in its own memory (CreatePlacedResourceX): on the console the GPU
 //! samples that memory, laid out as the console's layout library says (`hle::xg`, checked
 //! against the console's own). Here a PC texture holds a detiled copy: uploaded when the
@@ -39,6 +40,9 @@ type Upload = (usize, usize, Arc<xg::Texture>, D3D12_RESOURCE_STATES);
 struct Entry {
     device: usize,
     va: usize,
+    /// CPU view from which texels and dirty writes are read; title address stays va.
+    src: usize,
+    in_gpu_view: bool,
     tex: Arc<xg::Texture>,
     /// the state the texture was created in (uploads leave it there)
     state: D3D12_RESOURCE_STATES,
@@ -76,14 +80,49 @@ pub fn counts() -> (usize, u64) {
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
-    // render targets and depth buffers are the GPU's (their metadata planes, empty planes)
-    if tex.planes.len() != 1 || tex.texels().is_none() {
+    // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
+    // title's bytes are not the resource's texels
+    if matches!(u32::from_le_bytes(desc[0x20..0x24].try_into().unwrap()), 116 | 117) {
+        return Err("a console float format the PC holds as R16G16B16A16_FLOAT".into());
+    }
+    // Render targets and depth buffers are the GPU's (their metadata planes, empty planes) –
+    // except a small single-sample colour target with texels: a retail title makes its glyph
+    // caches that way (256x256 R8 with ALLOW_RENDER_TARGET, two planes) and fills them from the
+    // CPU. Left to the GPU they stayed as they were made and its menus' body text lost most of
+    // its letters. Such a target is uploaded like any texture when the CPU wrote its pages; one
+    // the title only renders to is not CPU-written and so not uploaded over.
+    // `XCL_SYNC_SMALL_TARGETS=0` turns this off.
+    let small_target = {
+        let (w, h) = (u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap()), u32::from_le_bytes(desc[0x18..0x1c].try_into().unwrap()));
+        let (samples, flags) = (u32::from_le_bytes(desc[0x24..0x28].try_into().unwrap()), u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap()));
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| std::env::var("XCL_SYNC_SMALL_TARGETS").is_ok_and(|v| v.trim() == "0"));
+        // (64x64 and up: 1x1 placeholders are not worth an entry; 0x2: a depth buffer)
+        !off && w <= 1024 && h <= 1024 && w * h as u64 >= 64 * 64 && samples <= 1 && flags & 0x2 == 0
+    };
+    if tex.texels().is_none() || (tex.planes.len() != 1 && !small_target) {
         return Err("a render target / depth buffer".into());
+    }
+    if tex.planes.len() != 1 {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 2 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: a small render target at {va:#x} ({} planes) is kept in step with the title's memory – a glyph cache the CPU fills ({n} so far)", tex.planes.len());
+        }
     }
     if ID3D12Resource::from_raw_borrowed(&res).is_none() {
         return Err("no resource".into());
     }
-    let e = Entry { device: device as usize, va, tex: Arc::new(tex), state, pending: true, gpu_written: false };
+    let src = mirror_source(va);
+    if src != va {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 2 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: a texture at {va:#x} lies in a GPU view of the title's CPU memory: kept in step with {src:#x} ({n} so far)");
+        }
+    }
+    let in_gpu_view = crate::hle::kernelx::mirrors::source(va).is_some();
+    let e = Entry { device: device as usize, va, src, in_gpu_view, tex: Arc::new(tex), state, pending: true, gpu_written: false };
     {
         let mut t = TEXTURES.lock().unwrap();
         if let Some(old) = t.insert(res as usize, e) {
@@ -98,6 +137,40 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     Ok(())
 }
 
+/// Where a texture at `va` is read from: the CPU view behind a GPU view (`kernelx::mirrors`)
+/// when nothing is mapped at `va` itself, else `va`.
+pub(super) fn mirror_source(va: usize) -> usize {
+    let Some(src) = crate::hle::kernelx::mirrors::source(va) else { return va };
+    if crate::hle::kernelx::physical_page_at(va) { return va; }
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let mapped = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
+    if mapped { va } else { src }
+}
+
+fn recheck_gpu_view_sources() {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let gen = crate::hle::kernelx::gpu_view_map_gen();
+    if SEEN.swap(gen, Ordering::AcqRel) == gen { return; }
+    let mut changed = false;
+    for e in TEXTURES.lock().unwrap().values_mut() { changed |= recheck_source(e); }
+    if changed { TEXTURES_GEN.fetch_add(1, Ordering::Release); }
+}
+
+fn recheck_source(e: &mut Entry) -> bool {
+    if !e.in_gpu_view { return false; }
+    let src = mirror_source(e.va);
+    if src == e.src { return false; }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("title texture CPU source at {:#x} changed {:#x} -> {src:#x} after a physical mapping ({n} changes)", e.va, e.src);
+    }
+    e.src = src;
+    if !e.pending { e.pending = true; PENDING.fetch_add(1, Ordering::Relaxed); }
+    true
+}
+
 /// The title's GPU work writes texture `res` (a copy into it): on the console the memory then
 /// holds what the GPU wrote; here the CPU's view of it is stale, so it is not uploaded again
 /// (a CPU write elsewhere on its pages – a neighbour, an allocator's header – would upload the
@@ -105,6 +178,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
 /// by the GPU). The first upload, if still pending, stays: it runs before the title's submit
 /// that copies.
 pub fn note_gpu_write(res: usize) {
+    super::texture_residency::ensure_or_stop(res);
     if let Some(e) = TEXTURES.lock().unwrap().get_mut(&res) {
         if !e.gpu_written {
             e.gpu_written = true;
@@ -169,7 +243,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().map(|e| (e.va & !0xFFF, (e.va + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
@@ -206,6 +280,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
         return;
     }
+    recheck_gpu_view_sources();
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
     let ranges = cached_watch_ranges(u);
@@ -245,7 +320,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             let content = |e: &Entry| -> usize {
                 let size = e.tex.size() as usize;
                 (0..16usize)
-                    .map(|k| e.va + (size.saturating_sub(4096)) * k / 15)
+                    .map(|k| e.src + (size.saturating_sub(4096)) * k / 15)
                     .filter(|&a| crate::gpu::shader::readable(a, 4096))
                     .map(|a| std::slice::from_raw_parts(a as *const u8, 4096).iter().filter(|&&b| b != 0).count())
                     .sum()
@@ -286,8 +361,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 if e.gpu_written {
                     return false;
                 }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.va);
-                dirty.get(i).is_some_and(|&p| p < e.va + e.tex.size() as usize)
+                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
+                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
             })
             .filter_map(|(&res, e)| {
                 if e.pending {
@@ -295,7 +370,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.state)))
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.state)))
             })
             .collect()
     });
@@ -323,6 +398,14 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 break;
             }
             let (r, (dev, va, tex, state)) = todo.next().unwrap();
+            if super::texture_residency::unmapped(r.as_raw() as usize)
+                && !super::texture_residency::has_data(va, tex.size() as usize) {
+                static EMPTY: AtomicU64 = AtomicU64::new(0);
+                let n = EMPTY.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() { crate::xlog_info!("streamed textures: {n} empty initial uploads deferred"); }
+                continue;
+            }
+            super::texture_residency::ensure_or_stop(r.as_raw() as usize);
             device = dev;
             bytes += tex.size() as usize;
             let subs = subresources(va, &tex);
@@ -331,6 +414,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             batch.push((r, subs, state, state));
         }
+        if batch.is_empty() { continue; }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
         let queue = match upload_queue(dev, device) {
@@ -383,7 +467,7 @@ pub unsafe fn probe_gpu_content(res: usize) {
         }
         g.push(res);
     }
-    let Some((device, va, tex, gpu_written)) = TEXTURES.lock().unwrap().get(&res).map(|e| (e.device, e.va, Arc::clone(&e.tex), e.gpu_written)) else { return };
+    let Some((device, va, tex, gpu_written)) = TEXTURES.lock().unwrap().get(&res).map(|e| (e.device, e.src, Arc::clone(&e.tex), e.gpu_written)) else { return };
     let d = device as *mut c_void;
     let r = res as *mut c_void;
     let (Some(dev), Some(r)) = (ID3D12Device::from_raw_borrowed(&d), ID3D12Resource::from_raw_borrowed(&r)) else { return };
@@ -502,7 +586,7 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
 
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
 /// has only some of its pages mapped).
-unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
+pub(super) unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut out = vec![0u8; len];
     let mut p = at;
@@ -544,6 +628,92 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_texture_source_reads_late_cpu_writes_without_changing_title_address() { unsafe {
+        use windows_sys::Win32::System::Memory as mem;
+        // Match the title's reservations: larger than the 12 GiB UMA windows,
+        // so they exercise the write-watched Windows fallback, not sparse UMA.
+        let size = 65536;
+        let reservation = 24usize << 30;
+        let cpu = crate::hle::kernelx::VirtualAlloc(std::ptr::null(), reservation, 0x2040_2000, mem::PAGE_READWRITE);
+        let gpu = crate::hle::kernelx::VirtualAlloc(std::ptr::null(), reservation, 0x2040_2000, 0x801);
+        assert!(!cpu.is_null() && !gpu.is_null());
+        assert_eq!(mirror_source(gpu as usize + 128), cpu as usize + 128);
+        assert!(read_committed(gpu as usize, size).iter().all(|&b| b == 0));
+        assert!(!mem::VirtualAlloc(cpu, size, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+        let mut pages = [std::ptr::null_mut(); 16];
+        let mut count = pages.len(); let mut granularity = 0;
+        assert_eq!(GetWriteWatch(1, cpu, size, pages.as_mut_ptr(), &mut count, &mut granularity), 0);
+        *(cpu as *mut u8).add(12345) = 0x6b;
+        count = pages.len();
+        assert_eq!(GetWriteWatch(0, cpu, size, pages.as_mut_ptr(), &mut count, &mut granularity), 0);
+        assert!(pages[..count].iter().any(|&p| p as usize <= cpu as usize + 12345 && cpu as usize + 12345 < p as usize + granularity as usize));
+        let src = mirror_source(gpu as usize);
+        assert_eq!(read_committed(src, size)[12345], 0x6b, "upload sees data written after reservation");
+        assert!(read_committed(gpu as usize, size).iter().all(|&b| b == 0), "title GPU address stays a separate reservation");
+        assert!(!mem::VirtualAlloc(gpu, size, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+        assert_eq!(mirror_source(gpu as usize), gpu as usize, "an explicitly mapped GPU view keeps its own contents");
+        assert_ne!(crate::hle::kernelx::VirtualFree(cpu, 0, mem::MEM_RELEASE), 0);
+        assert_eq!(crate::hle::kernelx::mirrors::source(gpu as usize), None);
+        assert_ne!(crate::hle::kernelx::VirtualFree(gpu, 0, mem::MEM_RELEASE), 0);
+    }}
+
+    /// A physical page mapped into a GPU view but not used yet (reserved until its first
+    /// access, `kernelx::lazy`) is that address's own source, not the CPU view behind it.
+    /// (Test by Kalmarv, review of PR #283.)
+    #[test]
+    fn mapped_gpu_view_replaces_a_previously_registered_cpu_source() {
+        use crate::hle::kernelx;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const VIEW: usize = 16 << 20;
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let cpu = VirtualAlloc(std::ptr::null(), VIEW, MEM_RESERVE, PAGE_READWRITE) as usize;
+            let gpu = VirtualAlloc(std::ptr::null(), VIEW, MEM_RESERVE, PAGE_READWRITE) as usize;
+            kernelx::mirrors::reserved(cpu, VIEW, 0x2040_2000, 0x04);
+            kernelx::mirrors::reserved(gpu, VIEW, 0x2040_2000, 0x801);
+            assert_eq!(mirror_source(gpu + 0x2_0000), cpu + 0x2_0000); // nothing mapped: the CPU view
+            let (mut n, mut pages) = (1usize, [0usize; 1]);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let at = gpu + 0x2_0000;
+            // a texture placed there before the page is mapped reads the CPU view …
+            let mut d = [0u8; 0x38];
+            d[0..4].copy_from_slice(&3u32.to_le_bytes());
+            d[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+            d[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+            d[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+            d[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+            d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+            d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
+            let tex = Arc::new(xg::Texture::new(&d).unwrap());
+            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, state: D3D12_RESOURCE_STATE_COMMON, pending: false, gpu_written: false };
+            assert_eq!(e.src, cpu + 0x2_0000);
+            assert!(!recheck_source(&mut e), "nothing changed yet");
+            assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
+            // … and the page mapped under it later, uploaded again
+            assert!(recheck_source(&mut e));
+            assert_eq!(e.src, at);
+            assert!(e.pending);
+            PENDING.fetch_sub(1, Ordering::Relaxed);
+            let before = mirror_source(at);
+            let generation = kernelx::gpu_view_map_gen();
+            (at as *mut u32).write_volatile(7); // its first use commits it
+            let after = mirror_source(at);
+            let mut none = [0usize; 1];
+            kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, none.as_mut_ptr());
+            assert!(kernelx::gpu_view_map_gen() > generation);
+            assert!(recheck_source(&mut e), "unmapping restores the CPU source");
+            assert_eq!(e.src, cpu + 0x2_0000);
+            kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr());
+            kernelx::mirrors::released(cpu);
+            VirtualFree(cpu as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(gpu as *mut c_void, 0, MEM_RELEASE);
+            assert_eq!(after, at);
+            assert_eq!(before, at, "a page mapped at the address but not used yet is its source too");
+        }
+    }
 
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.
     #[test]

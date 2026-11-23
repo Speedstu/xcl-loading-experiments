@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! Console shaders in pipeline states: a shader blob a title passes to Create*PipelineState
 //! (DXBC container with XDAT/XBCH/FSSM, no usable DXIL) becomes DXIL through the recompiler,
 //! and the pipeline gets XCL's shader ABI root signature instead of the title's one:
@@ -431,19 +432,27 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
             .any(|name| present(name)))
 }
 
+/// User SGPRs of a console compute shader (COMPUTE_PGM_RSRC2 in FSPX or FSSM):
+/// s0…s3 are the driver's, so what is above 4 is the root arguments its compiler passed in
+/// registers. None: not a console compute shader.
+pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
+    if let Some(f) = fspx(blob) {
+        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2).user_sgprs);
+    }
+    let sh = xbox::parse(blob)?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
+    match interface(blob, &sh, f)? {
+        Mode::Compute(cs) => Some(cs.user_sgprs),
+        _ => None,
+    }
+}
+
 fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
-        let r = f.rsrc2;
-        let cs = super::CsInterface {
-            threads: f.threads,
-            user_sgprs: (r >> 1) & 31,
-            tgid: [(r >> 7) & 1 == 1, (r >> 8) & 1 == 1, (r >> 9) & 1 == 1],
-            tg_size: (r >> 10) & 1 == 1,
-            tid_components: ((r >> 11) & 3) + 1,
-        };
+        let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
         let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
@@ -558,6 +567,46 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
     let record = g.record();
     let translation = super::translate_geometry(&code, g, split_wave64, mem_windows())?;
     finish_two_pass(translation, record, ps)
+}
+
+/// The geometry shader (gs_6_6 DXIL) that draws a console rect list's rectangles behind the
+/// console VS `vs` (its container): `emit::rect_list_gs` for the VS's output signature, which
+/// is what the translated VS's output struct is declared from.
+pub fn rect_list_gs(vs: &[u8]) -> Result<Vec<u8>, String> {
+    let outputs = crate::gpu::dxbc::signatures(vs).1;
+    if outputs.is_empty() {
+        return Err("the VS has no output signature".into());
+    }
+    Ok(dxc::compile_cached(&super::emit::rect_list_gs(&outputs)?, "main", "gs_6_6")?.0)
+}
+
+/// Whether the console PS `ps` (its container) reads an attribute flat: an integer input, or a
+/// `v_interp_mov_f32` – what the translation declares `nointerpolation` (`emit`, `XclIn`). A rect
+/// list's flat values are not carried by `rect_list_gs` (see there).
+pub fn ps_reads_flat(ps: &[u8]) -> Result<bool, String> {
+    let sh = xbox::parse(ps).ok_or("not a console shader container")?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 5)).ok_or("no PS hardware variant")?;
+    let Some(Mode::Pixel(psi)) = interface(ps, &sh, f) else {
+        return Err("unknown PS interface".into());
+    };
+    if super::ranked(&psi.inputs, false).iter().any(|e| e.component_type != 3) {
+        return Ok(true);
+    }
+    let p = f.programs.first().ok_or("FSSM without a program")?;
+    reads_flat(&f.data[p.offset..p.offset + p.len])
+}
+
+/// Whether PS code has a `v_interp_mov_f32`.
+pub fn reads_flat(code: &[u8]) -> Result<bool, String> {
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let d = crate::gpu::rdna2::decode(&code[off..], off as u64).map_err(|e| format!("+{off:#x}: cannot decode ({e:?})"))?;
+        if d.inst.name.eq_ignore_ascii_case("v_interp_mov_f32") {
+            return Ok(true);
+        }
+        off += d.len;
+    }
+    Ok(false)
 }
 
 /// XCL shader ABI root signature (see the module docs); `graphics` allows an input layout.

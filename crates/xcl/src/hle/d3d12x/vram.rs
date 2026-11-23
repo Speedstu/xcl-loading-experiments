@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! GPU-owned textures in title memory, aliased as on the console.
 //!
 //! A console title places render targets, depth buffers and UAV textures at addresses of its
@@ -99,8 +100,16 @@ fn plan(arenas: &[(usize, usize)], va: usize, bytes: usize) -> Plan {
 unsafe fn arena_for(dev: &ID3D12Device, va: usize, bytes: usize) -> Option<(ID3D12Heap, u64)> {
     let mut g = ARENAS.lock().unwrap();
     let ranges: Vec<(usize, usize)> = g.iter().map(|a| (a.base, a.size)).collect();
-    let (base, size, replaces) = match plan(&ranges, va, bytes) {
-        Plan::Reuse { index, offset } => return Some((g[index].heap.clone(), offset as u64)),
+    // A sparse title window is a known, bounded reservation. Keeping one heap
+    // for the whole window avoids repeatedly replacing growing heaps whose old
+    // resources retain the previous allocation (and no longer alias new ones).
+    let whole_window = std::env::var("XCL_VRAM_WHOLE_WINDOW").is_ok_and(|v| v == "1")
+        .then(|| crate::gpu::uma::get()).flatten()
+        .and_then(|u| u.window_of(va).filter(|&k| u.is_sparse_window(k)).map(|k| u.window(k)))
+        .filter(|&(base, size)| va.checked_add(bytes).is_some_and(|end| end <= base + size));
+    let (request, extent) = whole_window.unwrap_or((va, bytes));
+    let (base, size, replaces) = match plan(&ranges, request, extent) {
+        Plan::Reuse { index, .. } => return Some((g[index].heap.clone(), (va - g[index].base) as u64)),
         Plan::New { base, size, replaces } => (base, size, replaces),
     };
     let desc = D3D12_HEAP_DESC {
@@ -143,6 +152,12 @@ fn tier2(dev: &ID3D12Device) -> bool {
 /// A GPU-owned texture of the title at `va` (`desc`: the PC description): placed in the arena
 /// for that address (None: it cannot be – the caller makes a resource of its own).
 pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, clear: *const c_void, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    if std::env::var("XCL_VRAM_TILED").is_ok_and(|v| v == "1") {
+        if let Some(hr) = super::texture_tiles::place(this, va, desc, state, clear, ppv) {
+            if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() { PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize); }
+            return Some(hr);
+        }
+    }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     if !tier2(dev) {
         return None;
@@ -157,6 +172,7 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
         return None;
     }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    super::real::note_title_address(*ppv as usize, va);
     Some(hr)
 }
 
@@ -203,6 +219,20 @@ mod tests {
         assert_eq!(arenas, [(0x1_0200_0000, 0x1_0C00_0000 - 0x1_0200_0000)]);
         // the third placement, at the first one's address, shares the new arena with the second
         assert_eq!(landed[1], landed[2]);
+    }
+
+    #[test]
+    fn a_whole_title_window_keeps_one_heap_for_straddling_textures() {
+        let base = 0x4_0000_0000;
+        let size = 4usize << 30;
+        let mut arenas = Vec::new();
+        let p = plan(&arenas, base, size);
+        assert_eq!(p, Plan::New { base, size, replaces: vec![] });
+        arenas.push((base, size));
+        for offset in [0, 120 * MIB, 127 * MIB, 250 * MIB, 3800 * MIB] {
+            assert_eq!(plan(&arenas, base + offset, 24 * MIB), Plan::Reuse { index: 0, offset });
+        }
+        assert_eq!(arenas.len(), 1);
     }
 
     #[test]

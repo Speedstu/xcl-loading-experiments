@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! Runs recompiled kernels on the real GPU (D3D12 compute): the test bench for
 //! instruction semantics and for whole console shaders.
 //!
@@ -611,6 +612,23 @@ pub fn draw(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
+    draw_gs(vs, None, ps, layout, vertices, stride, sgprs, mem, size, clear)
+}
+
+/// `draw` with a geometry shader (DXIL) between the VS and the PS.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_gs(
+    vs: &[u8],
+    gs: Option<&[u8]>,
+    ps: &[u8],
+    layout: &[VertexElement],
+    vertices: &[f32],
+    stride: u32,
+    sgprs: &[u32],
+    mem: &[u32],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<Vec<[f32; 4]>, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     unsafe {
@@ -634,6 +652,7 @@ pub fn draw(
             pRootSignature: transmute_copy(&rs),
             VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
             PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
+            GS: gs.map_or_else(D3D12_SHADER_BYTECODE::default, |g| D3D12_SHADER_BYTECODE { pShaderBytecode: g.as_ptr() as _, BytecodeLength: g.len() }),
             SampleMask: u32::MAX,
             InputLayout: D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: elems.as_ptr(), NumElements: elems.len() as u32 },
             PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
@@ -835,7 +854,10 @@ pub fn draw_on_multi(
         list.ClearRenderTargetView(rtv, &clear, None);
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
-        let _bound = if textures.is_empty() && samplers.is_empty() { bind_resources(dev, &list, &[], &[]).map(|_| Vec::new())? } else { bind_views(dev, &list, textures, samplers)? };
+        // Both variants must retain their heaps until submission has completed.
+        let (_resources, _views) = if textures.is_empty() && samplers.is_empty() {
+            (Some(bind_resources(dev, &list, &[], &[])?), Vec::new())
+        } else { (None, bind_views(dev, &list, textures, samplers)?) };
         list.SetGraphicsRootSignature(rs);
         list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());

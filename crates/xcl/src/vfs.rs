@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! Virtual file system (design §5.4).
 //!
 //! * Console path prefixes (`G:\`, `GAME:`, `T:\` …) are translated via mounts.
@@ -232,10 +233,16 @@ impl Vfs {
         if is_device(&p) {
             return Target::Pass;
         }
-        let p = strip_verbatim(&p);
+        let mut p = strip_verbatim(&p);
         if p.starts_with("\\\\") {
             return Target::Pass; // UNC
         }
+        // A retail title opens "G:\\.\\data\\...". Match specific file or
+        // directory mounts after removing current-directory components, rather
+        // than accidentally selecting the broader G: mount. Device paths above
+        // must remain untouched.
+        while p.contains("\\.\\") { p = p.replace("\\.\\", "\\"); }
+        if p.ends_with("\\.") { p.truncate(p.len() - 2); }
         let (p, translated) = match self.apply_mounts(&p) {
             Some(t) if !self.in_own_folders(&p, &full) => (t, true),
             _ => (p, false),
@@ -693,6 +700,23 @@ mod tests {
         assert_eq!(v.classify("CONOUT$"), Target::Pass);
         assert_eq!(v.classify("\\\\.\\pipe\\x"), Target::Pass);
         assert_eq!(v.classify("C:\\Windows\\notepad.exe"), Target::Pass);
+    }
+
+    #[test]
+    fn dot_components_do_not_bypass_specific_archive_mounts() {
+        let f = Fixture::new("dot_mount");
+        let copy = f.dir.join("ssd");
+        let archive = copy.join("levels.rpf").to_string_lossy().to_string();
+        let data = copy.join("data").to_string_lossy().to_string();
+        let v = Vfs::new(&f.game(), &f.dir.join("xcldata"), vec![
+            ("G:".into(), f.game().to_string_lossy().into()),
+            ("G:\\levels.rpf".into(), archive.clone()),
+            ("G:\\data".into(), data.clone()),
+        ]);
+        assert_eq!(v.classify("G:\\.\\levels.rpf"), Target::Translated(archive));
+        assert_eq!(v.classify("G:\\.\\.\\data\\ttdb\\file.ttpf"), Target::Translated(format!("{data}\\ttdb\\file.ttpf")));
+        assert_eq!(v.classify("\\\\.\\pipe\\x"), Target::Pass);
+        assert_eq!(v.classify("G:\\."), Target::Game { rel: String::new() });
     }
 
     /// The console's "D:" mount on a PC whose game and XCL data are on its D: drive: paths

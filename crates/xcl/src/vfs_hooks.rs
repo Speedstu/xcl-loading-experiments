@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! Process-wide Win32 file API hooks feeding the VFS.
 //!
 //! Hooks sit on KERNELBASE exports, so they also catch calls made by the CRT
@@ -64,6 +65,26 @@ static O_CREATE_FILE_W: AtomicUsize = AtomicUsize::new(0);
 static O_CREATE_FILE_A: AtomicUsize = AtomicUsize::new(0);
 static O_CREATE_FILE_2: AtomicUsize = AtomicUsize::new(0);
 
+/// Opt-in cached reads for immutable asset archives on slower host storage.
+/// Write handles and paths outside the title remain unchanged. This profile is
+/// for titles using ReadFile, not ReadFileScatter (which requires unbuffered I/O).
+fn asset_read_flags(v: &vfs::Vfs, path: &str, access: u32, flags: u32) -> u32 {
+    const NO_BUFFERING: u32 = 0x2000_0000;
+    const WRITE_ACCESS: u32 = 0x500D_0116;
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| std::env::var("XCL_BUFFERED_READS").is_ok_and(|s| s == "1"));
+    if !enabled || flags & NO_BUFFERING == 0 || access & WRITE_ACCESS != 0 {
+        return flags;
+    }
+    let lower = path.to_ascii_lowercase();
+    if !(lower.ends_with(".rpf") || lower.ends_with(".ttpf")) || !matches!(v.classify(path), Target::Game { .. }) {
+        return flags;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("VFS: XCL_BUFFERED_READS=1: read-only RPF/TTPF archives use the host file cache"));
+    flags & !NO_BUFFERING
+}
+
 /// The first opens with their flags (how a title reads: overlapped / unbuffered I/O writes
 /// memory without the CPU – write-watch does not see it).
 fn log_open(api: &str, path: &str, flags: u32) {
@@ -86,6 +107,7 @@ unsafe extern "system" fn hk_create_file_w(n: *const u16, acc: u32, sh: u32, sa:
     let orig = orig!(O_CREATE_FILE_W as FnCreateFileW);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
+    let fl = asset_read_flags(v, &path, acc, fl);
     log_open("CreateFileW", &path, fl);
     match v.open_decision(&path, acc, disp, fl) {
         Decision::Pass => orig(n, acc, sh, sa, disp, fl, t),
@@ -102,6 +124,7 @@ unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: 
     let orig = orig!(O_CREATE_FILE_A as FnCreateFileA);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_ansi_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
+    let fl = asset_read_flags(v, &path, acc, fl);
     log_open("CreateFileA", &path, fl);
     match v.open_decision(&path, acc, disp, fl) {
         Decision::Pass => orig(n, acc, sh, sa, disp, fl, t),

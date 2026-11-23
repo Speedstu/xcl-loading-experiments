@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! Presentation for the real backend.
 //!
 //! Console titles do not use DXGI swap chains: they render into their own back buffers
@@ -83,14 +84,16 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("D3D12.X: PresentX now with {plane_count} plane(s): {words:x?}");
         }
     }
-    let count = (planes.add(8) as *const u32).read_unaligned();
-    let list = (planes.add(0x10) as *const usize).read_unaligned();
-    if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
-        return;
-    }
-    let res = (list as *const usize).read_unaligned();
-    if res == 0 {
-        return;
+    static PLANE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let requested = *PLANE.get_or_init(|| std::env::var("XCL_PRESENT_PLANE").ok().and_then(|v| v.parse().ok()));
+    let selected = requested.filter(|&n| n < plane_count).unwrap_or(0);
+    let Some(res) = presented_plane_resource(planes, plane_count, selected) else { return };
+    if !enabled() { return; }
+    if selected != 0 {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 2 {
+            crate::xlog_info!("PresentX: displaying explicit title plane {selected}/{plane_count}, resource {res:#x}; no intermediate RT selection");
+        }
     }
     {
         let mut p = PRESENTED.lock().unwrap();
@@ -123,11 +126,53 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("frame trace: PresentX #{n} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
         }
     }
-    present_now(Duration::ZERO, Some((queue as usize, res)));
+    // Opt-in diagnostic presentation of a real render pass, while the title's
+    // final composition is being investigated. The owned reference stays alive
+    // until present_now has retained the source for its submitted copy.
+    let diagnostic = (requested.is_none() && crate::state::config().present.eq_ignore_ascii_case("render-target"))
+        .then(|| diagnostic_render_target()).flatten();
+    let shown = diagnostic.as_ref().map_or(res, |r| r.as_raw() as usize);
+    DIAGNOSTIC_FINAL.with(|v| v.set(if shown != res { res } else { 0 }));
+    present_now(Duration::ZERO, Some((queue as usize, shown)));
+    DIAGNOSTIC_FINAL.with(|v| v.set(0));
+}
+
+/// The title's 0x48-byte plane records: token +0, count +8, resource array +0x10.
+/// A retail title submits two records; the second array was confirmed in its
+/// live call data to name the 3840x2160 render surface, unlike the first's 1080p surface.
+unsafe fn presented_plane_resource(planes: *const u8, count: u32, index: u32) -> Option<usize> {
+    if count == 0 || count > 16 || index >= count { return None; }
+    let plane = (planes as usize).checked_add(index as usize * 0x48)?;
+    if !crate::gpu::shader::readable(plane, 24) { return None; }
+    let resources = ((plane + 8) as *const u32).read_unaligned();
+    let array = ((plane + 16) as *const usize).read_unaligned();
+    if resources == 0 || !crate::gpu::shader::readable(array, 8) { return None; }
+    let resource = (array as *const usize).read_unaligned();
+    (resource != 0).then_some(resource)
+}
+
+#[cfg(test)]
+mod present_plane_tests {
+    use super::*;
+    #[test]
+    fn explicit_present_plane_uses_the_titles_second_resource_array() { unsafe {
+        let first = [0x1234usize]; let second = [0x5678usize];
+        let mut planes = [0u64; 18];
+        planes[0] = 11; planes[1] = 1; planes[2] = first.as_ptr() as u64;
+        planes[9] = 11; planes[10] = 1; planes[11] = second.as_ptr() as u64;
+        assert_eq!(presented_plane_resource(planes.as_ptr().cast(), 2, 0), Some(first[0]));
+        assert_eq!(presented_plane_resource(planes.as_ptr().cast(), 2, 1), Some(second[0]));
+        assert_eq!(presented_plane_resource(planes.as_ptr().cast(), 1, 1), None);
+        assert_eq!(presented_plane_resource(planes.as_ptr().cast(), 17, 0), None);
+        planes[10] = 0;
+        assert_eq!(presented_plane_resource(planes.as_ptr().cast(), 2, 1), None);
+    }}
 }
 
 thread_local! {
     static IN_PRESENT: Cell<bool> = const { Cell::new(false) };
+    // Capture the actual PresentX surface as well when a diagnostic RT is shown.
+    static DIAGNOSTIC_FINAL: Cell<usize> = const { Cell::new(0) };
 }
 
 fn now_ms() -> u64 {
@@ -616,13 +661,23 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
     let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
     p.list.ResourceBarrier(&b1);
-    p.list.CopyResource(&bb, &src);
+    super::resource_states::with_state(p.list.as_raw(), src.as_raw() as usize, 0x800, || p.list.CopyResource(&bb, &src));
     let due = frame_dump_due();
     let mut dumps = Vec::new();
     if due {
         if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
             dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
         }
+        DIAGNOSTIC_FINAL.with(|v| {
+            let raw = v.get() as *mut c_void;
+            if raw.is_null() { return; }
+            if let Some(original) = ID3D12Resource::from_raw_borrowed(&raw) {
+                let d = original.GetDesc();
+                if let Some((buffer, footprint)) = readback_copy(&p.list, original, &d) {
+                    dumps.push(FrameDump { _source: original.clone(), buffer, footprint, format: d.Format, tag: "final".into() });
+                }
+            }
+        });
     }
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
     // (and the targets the watched one's contents went on to: rt_<n>_<k>)
@@ -655,11 +710,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     let qraw = queue as *mut c_void;
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
-    q.ExecuteCommandLists(&[Some(cl)]);
+    super::queue_order::execute_native(q,&[Some(cl)]);
     p.copy_source = Some(src);
     p.dumps = dumps;
     p.value += 1;
-    if let Err(e) = q.Signal(&p.fence, p.value) {
+    if let Err(e) = super::queue_order::signal(q, &p.fence, p.value) {
         // The copy is already submitted. Without its signal, keep its resources and allocator.
         p.disabled = true;
         let e = fence::api_error(&p.dev, "Signal", e);
@@ -744,7 +799,7 @@ unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, 
     let rb = rb?;
     let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
     let s = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(src), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
-    list.CopyTextureRegion(&dst, 0, 0, 0, &s, None);
+    super::resource_states::with_state(list.as_raw(), src.as_raw() as usize, 0x800, || list.CopyTextureRegion(&dst, 0, 0, 0, &s, None));
     Some((rb, fp))
 }
 
@@ -801,6 +856,21 @@ pub unsafe fn watch_rt(rt: usize) {
     if let Some(old) = g.replace(rt) {
         release(old);
     }
+}
+
+/// A live target held by an RTV descriptor. Clone while its descriptor is
+/// locked, so concurrent replacement cannot free it between lookup and AddRef.
+unsafe fn diagnostic_render_target() -> Option<ID3D12Resource> {
+    let descriptors = RTVS.lock().unwrap();
+    let uses = USES.lock().unwrap();
+    let uses = uses.as_ref()?;
+    descriptors.as_ref()?.values().filter_map(|&r| {
+        let raw = r as *mut c_void;
+        let resource = ID3D12Resource::from_raw_borrowed(&raw)?;
+        let d = resource.GetDesc();
+        if d.SampleDesc.Count != 1 || d.Width < 640 || d.Height < 360 || swap_format(d.Format).is_none() { return None; }
+        Some((uses.get(&r).map_or(0, |u| u[USE_RT]), resource.clone()))
+    }).max_by_key(|(uses, _)| *uses).map(|(_, r)| r)
 }
 
 /// the single-sampled resource bound as a render target most often (`XCL_TRACE_FRAME`; a

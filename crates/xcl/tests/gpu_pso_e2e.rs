@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! End to end without a game executable: real console shaders from the retail pack
 //! (`XCL_SAMPLE_RPF`) go through the D3D12.X backend's CreateGraphicsPipelineState hook
 //! exactly as a title would hand them over → recompiled VS/PS → D3D12 pipeline → drawn into
@@ -95,6 +96,10 @@ fn real_pso(pso: &ID3D12PipelineState) -> ID3D12PipelineState {
 
 /// The pipeline the title gets back (a stand-in when its shaders were not compiled yet).
 fn pso_through_hook_raw(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CStr, DXGI_FORMAT, u32)]) -> ID3D12PipelineState {
+    pso_through_hook_depth(dev, vs, ps, layout, DXGI_FORMAT_UNKNOWN)
+}
+
+fn pso_through_hook_depth(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CStr, DXGI_FORMAT, u32)], depth: DXGI_FORMAT) -> ID3D12PipelineState {
     let game_rs: ID3D12RootSignature = unsafe {
         let desc = D3D12_ROOT_SIGNATURE_DESC { Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, ..Default::default() };
         let mut ser = None;
@@ -128,9 +133,19 @@ fn pso_through_hook_raw(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CS
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     desc.RasterizerState.DepthClipEnable = true.into();
     desc.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    if depth != DXGI_FORMAT_UNKNOWN {
+        desc.DSVFormat = depth;
+        desc.DepthStencilState.DepthEnable = true.into();
+        desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    }
     let before = real::stats();
     let pso: ID3D12PipelineState = unsafe { dev.CreateGraphicsPipelineState(&desc) }.expect("CreateGraphicsPipelineState through the backend hook");
     unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
+    if std::env::var("XCL_TEST_EXPECT_LAZY").is_ok_and(|v| v == "1") {
+        assert!(xcl::hle::d3d12x::pso_async::is_pending(pso.as_raw() as usize), "the driver must accept the stand-in with the Xbox depth format");
+        assert_eq!(real::stats().translated_pipelines, before.translated_pipelines, "the console pipeline must wait for its first use");
+    }
     // built in the background behind a stand-in when its shaders were not compiled yet
     xcl::hle::d3d12x::pso_async::resolve_wait(pso.as_raw() as usize);
     let after = real::stats();
@@ -147,6 +162,14 @@ fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
     let Some((blobs, dev, _serial)) = setup(&["VS_Rage_TransformPosCpv_f020b20e_Wrapped", "PS_Rage_Untextured_14f8529b_Wrapped"]) else { return };
     let pso = pso_through_hook(&dev, &blobs[0], &blobs[1], &UNTEXTURED_LAYOUT);
     check_untextured_triangle(&dev, &pso);
+}
+
+#[test]
+fn retail_depth_stencil_format_pipeline_is_accepted() {
+    let Some((blobs, dev, _serial)) = setup(&["VS_Rage_TransformPosCpv_f020b20e_Wrapped", "PS_Rage_Untextured_14f8529b_Wrapped"]) else { return };
+    let pso = pso_through_hook_depth(&dev, &blobs[0], &blobs[1], &UNTEXTURED_LAYOUT, DXGI_FORMAT(118));
+    let actual = real_pso(&pso);
+    assert!(real::is_translated_graphics(actual.as_raw() as usize));
 }
 
 const UNTEXTURED_LAYOUT: [(&CStr, DXGI_FORMAT, u32); 2] = [(c"POSITION", DXGI_FORMAT_R32G32B32_FLOAT, 0), (c"COLOR", DXGI_FORMAT_R32G32B32A32_FLOAT, 12)];
@@ -595,7 +618,7 @@ fn retail_mesh_pipelines_through_the_hook() {
         rt.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let s = Stream {
             rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: game_rs.as_raw() },
-            ms: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, v: code(&ms) },
+            ms: Sub { ty: if std::env::var("XCL_TEST_MESH_SLOT").is_ok_and(|v| v == "24") { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS } else { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS }, v: code(&ms) },
             ps: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, v: code(&ps) },
             rt: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, v: rt },
         };
@@ -603,7 +626,12 @@ fn retail_mesh_pipelines_through_the_hook() {
         tried += 1;
         let t0 = std::time::Instant::now();
         let desc = D3D12_PIPELINE_STATE_STREAM_DESC { SizeInBytes: std::mem::size_of::<Stream>(), pPipelineStateSubobjectStream: &s as *const _ as *mut _ };
-        match unsafe { d2.CreatePipelineState::<ID3D12PipelineState>(&desc) } {
+        let created = unsafe { d2.CreatePipelineState::<ID3D12PipelineState>(&desc) };
+        if std::env::var("XCL_TEST_EXPECT_STREAM_BACKGROUND").is_ok_and(|v| v == "1") {
+            let pso = created.as_ref().expect("background stream stand-in creation");
+            assert!(xcl::hle::d3d12x::pso_async::is_pending(pso.as_raw() as usize), "stream must exercise the background path from an empty DXIL cache");
+        }
+        match created {
             Ok(p) if real::two_pass_of(real_pso(&p).as_raw() as usize).is_some() => ok += 1,
             Ok(_) => failed.push(format!("{} + {}: PSO without a compute pass", r.name, pr.name)),
             Err(e) => {
@@ -625,6 +653,41 @@ fn retail_mesh_pipelines_through_the_hook() {
         println!("  translation error: {}", e.lines().take(6).collect::<Vec<_>>().join(" | "));
     }
     assert!(tried >= 3 && ok == tried, "{} failed", failed.len());
+}
+
+/// Retail legacy GS pipeline through CreateGraphicsPipelineState: VS (ES variant) + GS
+#[test]
+fn retail_mesh_full_stream_metadata_background() {
+    let Ok(path) = std::env::var("XCL_TEST_RETAIL_STREAM_STATE") else { return };
+    let Some((blobs, dev, _serial)) = setup(&["MSNC_VS_Cable_268cf7a5_Wrapped", "PS_Cable_268cf7a5_Wrapped"]) else { return };
+    if !mesh_shaders(&dev) { return; }
+    let state: Vec<(u32, Vec<u8>)> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let root: ID3D12RootSignature = unsafe {
+        let mut blob = None;
+        D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).unwrap();
+        let blob = blob.unwrap();
+        dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())).unwrap()
+    };
+    let mut stream = Vec::<u8>::new();
+    for (ty, mut bytes) in state {
+        if ty == 0 { bytes.copy_from_slice(&(root.as_raw() as usize).to_le_bytes()); }
+        if ty == 24 || ty == 2 {
+            let code = &blobs[if ty == 24 { 0 } else { 1 }];
+            bytes[..8].copy_from_slice(&(code.as_ptr() as usize).to_le_bytes());
+            bytes[8..16].copy_from_slice(&code.len().to_le_bytes());
+        }
+        let (_, align) = xcl::hle::d3d12x::null::subobject_payload(ty).unwrap();
+        let start = stream.len();
+        stream.extend_from_slice(&ty.to_le_bytes());
+        stream.resize(start + if align == 8 { 8 } else { 4 }, 0);
+        stream.extend_from_slice(&bytes);
+        stream.resize((stream.len() + 7) & !7, 0);
+    }
+    let desc = D3D12_PIPELINE_STATE_STREAM_DESC { SizeInBytes: stream.len(), pPipelineStateSubobjectStream: stream.as_mut_ptr() as _ };
+    let device2: ID3D12Device2 = dev.cast().unwrap();
+    let pso: ID3D12PipelineState = unsafe { device2.CreatePipelineState(&desc) }.expect("complete retail stream metadata");
+    assert!(xcl::hle::d3d12x::pso_async::is_pending(pso.as_raw() as usize));
+    assert!(real::two_pass_of(real_pso(&pso).as_raw() as usize).is_some());
 }
 
 /// Retail legacy GS pipeline through CreateGraphicsPipelineState: VS (ES variant) + GS

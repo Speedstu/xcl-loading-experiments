@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! The title's own memory, seen by the GPU: sparse windows.
 //!
 //! A console title keeps GPU data in memory it reserves and commits itself (XDefiant: one
@@ -16,7 +17,7 @@
 //! Buffers the title places there get reserved resources over the same tiles, so PC-side
 //! copies, views and barriers see the same memory.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -126,6 +127,37 @@ unsafe fn query_tile_holes(tile: usize) -> u16 {
     holes
 }
 
+/// Pending clears indexed by address. A physical-page remap can unmap tens of
+/// thousands of tiles before a submit: scanning every pending clear after each
+/// unmap made that path quadratic while holding the sparse-memory lock.
+#[derive(Default)]
+struct ZeroRanges(BTreeMap<usize, usize>);
+
+impl ZeroRanges {
+    fn push(&mut self, (a, n): (usize, usize)) {
+        // A later page clear at a tile's start must keep an existing whole-tile clear.
+        self.0.entry(a).and_modify(|old| *old = (*old).max(n)).or_insert(n);
+    }
+
+    fn remove_tile(&mut self, tile: usize) {
+        // Clear entries are page-aligned and no larger than a tile.
+        let keys: Vec<usize> = self.0.range(tile..tile.saturating_add(TILE)).map(|(&a, _)| a).collect();
+        for a in keys {
+            self.0.remove(&a);
+        }
+    }
+
+    fn take(&mut self) -> Vec<(usize, usize)> {
+        std::mem::take(&mut self.0).into_iter().collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize { self.0.len() }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool { self.0.is_empty() }
+}
+
 /// Update `mapped`, `free`, and `to_zero` for a decommit of `[a, a + n)`.
 /// Returns the base addresses of tiles that became completely uncommitted (`holes == 0xFFFF`)
 /// and were removed from `mapped` (ready to be unmapped from their sparse window buffers).
@@ -133,7 +165,7 @@ fn decommit_tiles(
     mapped: &mut FxHashMap<usize, TileEntry>,
     pinned: &FxHashMap<(u32, u32), u32>,
     free: &mut Vec<(u32, u32)>,
-    to_zero: &mut Vec<(usize, usize)>,
+    to_zero: &mut ZeroRanges,
     a: usize,
     n: usize,
 ) -> Vec<usize> {
@@ -175,14 +207,12 @@ fn decommit_tiles(
         pg = tile_end;
     }
     for &t in &unmapped {
+        to_zero.remove_tile(t);
         if let Some(entry) = mapped.remove(&t) {
             if !pinned.contains_key(&entry.pool) {
                 free.push(entry.pool);
             }
         }
-    }
-    if !unmapped.is_empty() {
-        to_zero.retain(|&(za, _)| mapped.contains_key(&(za & !(TILE - 1))));
     }
     unmapped
 }
@@ -214,7 +244,7 @@ struct State {
     /// placed buffers → the pool tiles they use
     buffers: FxHashMap<usize, Vec<(u32, u32)>>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
-    to_zero: Vec<(usize, usize)>,
+    to_zero: ZeroRanges,
     /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped)
     staging: Option<(ID3D12Resource, *mut u8)>,
     /// monotonic ring-buffer write/submitted/retired byte cursors
@@ -459,7 +489,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
             buffers: FxHashMap::default(),
-            to_zero: Vec::new(),
+            to_zero: ZeroRanges::default(),
             staging: None,
             ring_write: 0,
             ring_submitted: 0,
@@ -556,7 +586,7 @@ impl State {
                 counts.push(run);
                 i += run as usize;
             }
-            self.queue.UpdateTileMappings(
+            super::queue_order::update(&self.dev, &self.queue, || self.queue.UpdateTileMappings(
                 res,
                 coords.len() as u32,
                 Some(coords.as_ptr()),
@@ -567,7 +597,7 @@ impl State {
                 Some(offsets.as_ptr()),
                 Some(counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
-            );
+            ));
         }
     }
 
@@ -594,7 +624,7 @@ impl State {
             counts.push(run);
             i += run as usize;
         }
-        self.queue.UpdateTileMappings(
+        super::queue_order::update(&self.dev, &self.queue, || self.queue.UpdateTileMappings(
             res,
             coords.len() as u32,
             Some(coords.as_ptr()),
@@ -605,7 +635,7 @@ impl State {
             None,
             Some(counts.as_ptr()),
             D3D12_TILE_MAPPING_FLAG_NONE,
-        );
+        ));
     }
 
     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
@@ -705,7 +735,7 @@ impl State {
         if closed {
             if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
                 super::title_textures::own_work(|| {
-                    self.queue.ExecuteCommandLists(&[Some(l)]);
+                    super::queue_order::execute_native(&self.queue,&[Some(l)]);
                 });
             }
         }
@@ -856,7 +886,7 @@ impl State {
                 if s.rb_list.Close().is_ok() {
                     if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
                         super::title_textures::own_work(|| {
-                            s.queue.ExecuteCommandLists(&[Some(l)]);
+                            super::queue_order::execute_native(&s.queue,&[Some(l)]);
                         });
                     }
                 }
@@ -1084,8 +1114,8 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     }
     s.rb_value += 1;
     let v = s.rb_value;
-    if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.queue.Wait(&s.rb_fence, v);
+    if super::queue_order::signal(queue, &s.rb_fence, v).is_ok() {
+        let _ = super::queue_order::wait(&s.queue, &s.rb_fence, v);
     }
     s.readback_ranges(&merged);
 }
@@ -1103,7 +1133,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if s.window_index(va).is_none() {
         return;
     }
-    let zeroed = std::mem::take(&mut s.to_zero);
+    let zeroed = s.to_zero.take();
     if !zeroed.is_empty() {
         for &(a, n) in &zeroed {
             s.clear_sent_range(a, n);
@@ -1171,17 +1201,24 @@ pub unsafe fn committed(a: usize, n: usize) {
 /// full-tile decommit or incrementally via sub-tile decommits) give their video memory back
 /// (unless a placed buffer still pins the pool tile).
 pub unsafe fn decommitted(a: usize, n: usize) {
+    decommit_with(a, n, || ());
+}
+
+/// Keep OS decommit inside the same lock as tile removal. Otherwise a submit
+/// can query still-committed CPU pages, remap them, then read them after the
+/// decommit. In particular, scatter-unmapping many pages exposed that race.
+pub unsafe fn decommit_with<T>(a: usize, n: usize, decommit: impl FnOnce() -> T) -> T {
     if n == 0 {
-        return;
+        return decommit();
     }
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else {
         EARLY.lock().unwrap().retain(|&(x, m)| x + m <= a || x >= a + n);
-        return;
+        return decommit();
     };
     let tiles = decommit_tiles(&mut s.mapped, &s.pinned, &mut s.free, &mut s.to_zero, a, n);
     if tiles.is_empty() {
-        return;
+        return decommit();
     }
     s.runs = None;
     let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
@@ -1196,6 +1233,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     }
     MAPPED_GEN.fetch_add(1, Ordering::Release);
     s.signal();
+    decommit()
 }
 
 impl State {
@@ -1246,7 +1284,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let Some(s) = g.as_mut() else { return };
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
-    let zero_runs = std::mem::take(&mut s.to_zero);
+    let zero_runs = s.to_zero.take();
     for &(a, n) in &zero_runs {
         s.clear_sent_range(a, n);
     }
@@ -1317,7 +1355,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     s.scratch_runs = dirty_runs;
     let q = queue.as_raw() as usize;
     if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
-        let _ = queue.Wait(&s.fence, s.value);
+        let _ = super::queue_order::wait(queue, &s.fence, s.value);
         s.waited.insert(q, s.value);
     }
 }
@@ -1539,7 +1577,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 buffers: FxHashMap::default(),
-                to_zero: Vec::new(),
+                to_zero: ZeroRanges::default(),
                 staging: None,
                 ring_write: 0,
                 ring_submitted: 0,
@@ -1594,7 +1632,7 @@ mod tests {
         let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
         let mut pinned: FxHashMap<(u32, u32), u32> = FxHashMap::default();
         let mut free: Vec<(u32, u32)> = Vec::new();
-        let mut to_zero: Vec<(usize, usize)> = Vec::new();
+        let mut to_zero = ZeroRanges::default();
 
         // 1. Two 32 KiB decommits across a full 64 KiB tile.
         let t0 = 0x10_0000usize;
@@ -1643,10 +1681,84 @@ mod tests {
         mapped.insert(t3, TileEntry::with_holes((0, 13), 0xFFFF & !(1u16 << 2)));
         mapped.insert(t4, TileEntry::with_holes((0, 14), 0));
         assert!(decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t4, PAGE).is_empty());
-        assert_eq!(to_zero, vec![(t4, PAGE)]);
+        assert_eq!(to_zero.0, BTreeMap::from([(t4, PAGE)]));
         let u = decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t3 + 2 * PAGE, PAGE);
         assert_eq!(u, vec![t3]);
         assert_eq!(free, vec![(0, 13)]);
-        assert_eq!(to_zero, vec![(t4, PAGE)], "unrelated mapped tile's to_zero must remain");
+        assert_eq!(to_zero.0, BTreeMap::from([(t4, PAGE)]), "unrelated mapped tile's to_zero must remain");
+    }
+
+    #[test]
+    fn pending_clears_keep_whole_tiles_and_survive_bulk_remaps() {
+        let mut zeros = ZeroRanges::default();
+        zeros.push((TILE, TILE));
+        zeros.push((TILE, PAGE));
+        zeros.push((TILE + PAGE, PAGE));
+        zeros.push((2 * TILE, PAGE));
+        assert_eq!(zeros.0[&TILE], TILE, "a page clear must not shorten a whole-tile clear");
+        zeros.remove_tile(TILE);
+        assert_eq!(zeros.take(), vec![(2 * TILE, PAGE)]);
+        assert!(zeros.is_empty());
+
+        let mut mapped = FxHashMap::default();
+        let pinned = FxHashMap::default();
+        let mut free = Vec::new();
+        const COUNT: usize = 32_768;
+        for i in 0..COUNT {
+            let a = (2 * i + 1) * TILE;
+            mapped.insert(a, TileEntry::with_holes((0, i as u32), 0));
+            // Reused tiles waiting to be cleared, interleaved with tiles being removed.
+            zeros.push((a, TILE));
+            zeros.push((a + TILE, TILE));
+        }
+        let start = std::time::Instant::now();
+        for i in 0..COUNT {
+            let a = (2 * i + 1) * TILE;
+            assert_eq!(decommit_tiles(&mut mapped, &pinned, &mut free, &mut zeros, a, TILE), vec![a]);
+        }
+        println!("{COUNT} tile remaps, {} pending clears preserved: {:?}", zeros.len(), start.elapsed());
+        assert!(mapped.is_empty());
+        assert_eq!(free.len(), COUNT);
+        assert_eq!(zeros.len(), COUNT);
+        assert!(zeros.take().iter().enumerate().all(|(i, &(a, n))| a == (2 * i + 2) * TILE && n == TILE));
+    }
+}
+
+#[cfg(test)]
+mod atomic_decommit_tests {
+    use super::*;
+    #[test]
+    fn cpu_decommit_and_tile_removal_are_observed_atomically() {
+        unsafe {
+            super::super::real::init().unwrap();
+            let u=crate::gpu::uma::get().unwrap();
+            let (at,_)=u.sparse_alloc(TILE,TILE).unwrap();
+            let p=crate::hle::kernelx::VirtualAlloc(at as *const c_void,TILE,MEM_COMMIT,PAGE_READWRITE);
+            assert_eq!(p as usize,at);
+            assert!(mapped_ranges().iter().any(|&(a,n)|at>=a && at<a+n));
+            let (entered_tx,entered_rx)=std::sync::mpsc::channel();
+            let (release_tx,release_rx)=std::sync::mpsc::channel();
+            let writer=std::thread::spawn(move||decommit_with(at,TILE,||{
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                VirtualFree(at as *mut c_void,TILE,MEM_DECOMMIT)
+            }));
+            entered_rx.recv().unwrap();
+            let (start_tx,start_rx)=std::sync::mpsc::channel();
+            let (done_tx,done_rx)=std::sync::mpsc::channel();
+            let reader=std::thread::spawn(move||{start_tx.send(()).unwrap();let snapshot=mapped_ranges();done_tx.send(snapshot).unwrap();});
+            start_rx.recv().unwrap();
+            let early=done_rx.recv_timeout(std::time::Duration::from_millis(30));
+            release_tx.send(()).unwrap();
+            assert!(early.is_err(),"another submit observed tile removal before OS decommit completed");
+            assert_eq!(writer.join().unwrap(),1);
+            let ranges=done_rx.recv().unwrap();reader.join().unwrap();
+            assert!(!ranges.iter().any(|&(a,n)|at>=a && at<a+n));
+            let mut query:MEMORY_BASIC_INFORMATION=std::mem::zeroed();
+            assert_ne!(VirtualQuery(at as *const c_void,&mut query,std::mem::size_of_val(&query)),0);
+            assert_eq!(query.State,windows_sys::Win32::System::Memory::MEM_RESERVE);
+            assert_eq!(crate::hle::kernelx::VirtualFree(at as *mut c_void,0,windows_sys::Win32::System::Memory::MEM_RELEASE),1);
+            println!("A concurrent submit cannot observe or remap the range between tile removal and OS decommit");
+        }
     }
 }

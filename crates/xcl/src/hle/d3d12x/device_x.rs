@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! The console device's own methods and the PC ones whose arguments differ on the console.
 //!
 //! The console's ID3D12Device has the PC ID3D12Device methods at slots 0–43; from 44 on its
@@ -645,6 +646,64 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
     real::dev_create_sampler_x(this, &d, dest);
 }
 
+/// Console-only formats mapped consistently across resources, pipelines and views.
+/// Format-family approach adapted from ivall/xcl pull request #150 (GPL-2.0-only).
+pub fn pc_color_format(format: u32) -> u32 {
+    match format {
+        116 | 117 => 10,
+        other => other,
+    }
+}
+
+/// Format used for capability queries; preserve the caller's console enum afterwards.
+pub fn pc_view_format(format: u32) -> u32 {
+    match format {
+        118 => 45,
+        119 => 46,
+        120 => 47,
+        other => pc_color_format(other),
+    }
+}
+
+pub fn pc_dsv_format(format: u32) -> u32 {
+    match format {
+        118 | 119 => 45,
+        other => other,
+    }
+}
+
+pub fn pc_resource_format(format: u32) -> u32 {
+    match format {
+        116 | 117 => 10,
+        118 => 45,
+        119 | 120 => 44,
+        other => other,
+    }
+}
+
+pub fn pc_srv_format(format: u32) -> u32 {
+    match format {
+        116 | 117 => 10,
+        118 | 119 => 46,
+        120 => 47,
+        other => other,
+    }
+}
+
+pub unsafe fn pc_clear_value(clear: *const c_void, storage: &mut [u8; 20]) -> *const c_void {
+    if clear.is_null() || !crate::gpu::shader::readable(clear as usize, 20) {
+        return clear;
+    }
+    let format = (clear as *const u32).read_unaligned();
+    let mapped = if matches!(format, 118 | 119 | 120) { 45 } else { pc_color_format(format) };
+    if mapped == format {
+        return clear;
+    }
+    std::ptr::copy_nonoverlapping(clear as *const u8, storage.as_mut_ptr(), 20);
+    storage[..4].copy_from_slice(&mapped.to_le_bytes());
+    storage.as_ptr() as *const c_void
+}
+
 /// the console resource desc (0x38 bytes, D3D12_RESOURCE_DESC) as a PC one: its tile layouts
 /// and console flag bits mean nothing to a PC driver
 pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
@@ -652,19 +711,31 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     let dim = u32::from_le_bytes(d[0..4].try_into().unwrap());
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
     d[8..16].fill(0); // alignment: the driver's
+    let format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
+    d[0x20..0x24].copy_from_slice(&pc_resource_format(format).to_le_bytes());
     let layout = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { D3D12_TEXTURE_LAYOUT_ROW_MAJOR.0 } else { D3D12_TEXTURE_LAYOUT_UNKNOWN.0 };
     d[0x2C..0x30].copy_from_slice(&(layout as u32).to_le_bytes());
-    d[0x30..0x34].copy_from_slice(&(flags & 0xFF).to_le_bytes());
+    let pc_flags = if flags & 0x2 != 0 { flags & 0xFF & !0x4 } else { flags & 0xFF };
+    d[0x30..0x34].copy_from_slice(&pc_flags.to_le_bytes());
     d
+}
+
+/// The PC forbids a depth-stencil resource's UAV initial state as well as its UAV flag.
+pub fn pc_resource_state(desc: &[u8; 0x38], state: u32) -> u32 {
+    let flags = u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap());
+    let state = state & real::PC_RESOURCE_STATES;
+    if flags & 2 != 0 && state & 8 != 0 { (state & !8) | 0x10 } else { state }
 }
 
 /// device #25 GetResourceAllocationInfo(visible mask, count, descs) → {size, alignment},
 /// returned through a hidden pointer. Called the C way – (return buffer, device, …), XDefiant –
-/// or the C++ way – (device, return buffer, …): whichever argument is the device is `this`.
+/// or the C++ way – (device, return buffer, …): use the registered device's identity.
+/// A return buffer can contain a stale vtable pointer; inspecting that word corrupts the
+/// device when the buffer is mistaken for `this` (retail +0x344145).
 /// Textures get the console's size (XG: what the title then places them in); buffers and
 /// what XG does not model the PC's.
 pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x38]) -> *mut [u64; 2] {
-    let (this, ret) = if real::is_adopted(a) { (a, b as *mut [u64; 2]) } else { (b, a as *mut [u64; 2]) };
+    let (this, ret) = if real::is_device_object(a) { (a, b as *mut [u64; 2]) } else { (b, a as *mut [u64; 2]) };
     type F = unsafe extern "system" fn(*mut c_void, *mut [u64; 2], u32, u32, *const [u8; 0x38]) -> *mut [u64; 2];
     let pc: F = std::mem::transmute(real::orig_fn(this, 25));
     let (mut size, mut align) = (0u64, 0u64);
@@ -680,6 +751,10 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
             }
         };
         if s == u64::MAX || a == 0 {
+            static WARN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if WARN.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_warn!("GetResourceAllocationInfo failed: console desc {x:02x?}, PC desc {:02x?}", pc_resource_desc(&x));
+            }
             size = u64::MAX;
             break;
         }
@@ -697,12 +772,12 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
 /// each resource's {offset, alignment, size} goes to the last argument when there is one.
 pub(super) unsafe extern "system" fn get_resource_allocation_info2_x(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x48], infos: *mut [u64; 3]) -> *mut [u64; 2] {
     real::note_newer_device_method(108);
-    let ret = if real::is_adopted(a) { b } else { a } as *mut [u64; 2];
+    let ret = if real::is_device_object(a) { b } else { a } as *mut [u64; 2];
     let (mut size, mut align) = (0u64, 0u64);
     for k in 0..n as usize {
         let mut r = [0u64; 2];
         let d = if descs.is_null() { std::ptr::null() } else { descs.add(k) as *const [u8; 0x38] };
-        let (x, y) = if real::is_adopted(a) { (a, &mut r as *mut _ as *mut c_void) } else { (&mut r as *mut _ as *mut c_void, b) };
+        let (x, y) = if real::is_device_object(a) { (a, &mut r as *mut _ as *mut c_void) } else { (&mut r as *mut _ as *mut c_void, b) };
         get_resource_allocation_info_x(x, y, mask, 1, d);
         if r[0] == u64::MAX || r[1] == 0 {
             size = u64::MAX;
@@ -725,7 +800,7 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info2_x(a: *mut c_v
 /// returned through a hidden pointer - like #25 called the C way (a retail game: return buffer, device,
 /// ...) or the C++ way.
 pub(super) unsafe extern "system" fn get_custom_heap_properties_x(a: *mut c_void, b: *mut c_void, mask: u32, ty: u32) -> *mut [u32; 5] {
-    let (this, ret) = if real::is_adopted(a) { (a, b as *mut [u32; 5]) } else { (b, a as *mut [u32; 5]) };
+    let (this, ret) = if real::is_device_object(a) { (a, b as *mut [u32; 5]) } else { (b, a as *mut [u32; 5]) };
     type F = unsafe extern "system" fn(*mut c_void, *mut [u32; 5], u32, u32) -> *mut [u32; 5];
     let pc: F = std::mem::transmute(real::orig_fn(this, 26));
     let mut r = [0u32; 5];
@@ -763,11 +838,13 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     }
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = pc_resource_desc(&x);
+    let mut clear_buf = [0u8; 20];
+    let clear = pc_clear_value(clear, &mut clear_buf);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
-    let state = state & real::PC_RESOURCE_STATES;
+    let state = pc_resource_state(&d, state);
     if buffer {
         if let Some(hr) = real::place_at_title_address(this, va as usize, &d, state, clear, riid, ppv) {
             return hr;
@@ -782,6 +859,20 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         }
     }
     let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    if !buffer && flags == 0 && !matches!(u32::from_le_bytes(x[0x20..0x24].try_into().unwrap()), 116 | 117)
+        && crate::hle::xg::Texture::new(&x).is_ok_and(|t| t.planes.len() == 1 && t.texels().is_some()) {
+        let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+        if let Some(hr) = super::texture_residency::create(this, &pc, state, ppv) {
+            if hr >= 0 {
+                super::real::note_title_address(*ppv as usize, va as usize);
+                if let Err(e) = super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
+                    crate::xlog_error!("reserved texture registration: {e}");
+                    real::end_title(0x7c1000b);
+                }
+            }
+            return hr;
+        }
+    }
     let hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
@@ -900,6 +991,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hidden_returns_do_not_mistake_stale_vtables_for_devices() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("real D3D12 device");
+            let dev = dev.unwrap();
+            let raw = dev.as_raw();
+            real::adopt(raw, real::Kind::Device);
+            let vtable = *(raw as *const usize);
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 128, Height: 128,
+                DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let desc: [u8; 0x38] = std::mem::transmute(desc);
+            for cpp in [false, true] {
+                let mut ret = [vtable as u64, 0];
+                let result = ret.as_mut_ptr() as *mut c_void;
+                // The old test accepted this stack buffer as an adopted object.
+                assert!(real::is_adopted(result));
+                assert!(!real::is_device_object(result));
+                let (a, b) = if cpp { (raw, result) } else { (result, raw) };
+                assert_eq!(get_resource_allocation_info_x(a, b, 0, 1, &desc), result as *mut [u64; 2]);
+                assert!(ret[0] > 0 && ret[0] != u64::MAX && ret[1] > 0);
+                assert_eq!(*(raw as *const usize), vtable, "device vtable must survive either ABI");
+
+                ret = [vtable as u64, 0];
+                let mut desc1 = [0u8; 0x48];
+                desc1[..0x38].copy_from_slice(&desc);
+                let mut each = [0u64; 3];
+                get_resource_allocation_info2_x(a, b, 0, 1, &desc1, &mut each);
+                assert_eq!(ret[0], each[2]);
+                assert_eq!(ret[1], each[1]);
+                assert_eq!(*(raw as *const usize), vtable);
+
+                let mut props = [0u32; 6];
+                props[..2].copy_from_slice(&[(vtable as u64) as u32, ((vtable as u64) >> 32) as u32]);
+                let result = props.as_mut_ptr() as *mut c_void;
+                let (a, b) = if cpp { (raw, result) } else { (result, raw) };
+                get_custom_heap_properties_x(a, b, 0, D3D12_HEAP_TYPE_UPLOAD.0 as u32);
+                assert_eq!(props[0], D3D12_HEAP_TYPE_CUSTOM.0 as u32);
+                assert_eq!(*(raw as *const usize), vtable);
+            }
+        }
+    }
+
+    #[test]
     fn console_types_and_descs_become_pc_ones() {
         assert_eq!(pc_list_type(XBOX_TYPE_DMA), D3D12_COMMAND_LIST_TYPE_COPY.0 as u32);
         assert_eq!(pc_list_type(2), 2);
@@ -985,6 +1125,44 @@ mod tests {
         assert_eq!(rd32(&f, PSO_FLAGS), 1 | FLAG_DYNAMIC_DEPTH_BIAS);
         clear_dynamic_depth_bias(&mut f);
         assert_eq!(rd32(&f, PSO_FLAGS), 1);
+    }
+
+    #[test]
+    fn retail_depth_and_uav_descriptors_get_real_gpu_allocations() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("real D3D12 device");
+            let dev = dev.unwrap();
+            for (width, height, array, format) in [(2560, 1440, 1, 118), (768, 768, 6, 55)] {
+                let console = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: width, Height: height, DepthOrArraySize: array, MipLevels: 1,
+                    Format: DXGI_FORMAT(format), SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                };
+                let x = std::ptr::read_unaligned(&console as *const _ as *const [u8; 0x38]);
+                let converted = pc_resource_desc(&x);
+                let pc: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(converted.as_ptr() as *const _);
+                let mut invalid = pc;
+                invalid.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                assert_eq!(dev.GetResourceAllocationInfo(0, &[invalid]).SizeInBytes, u64::MAX, "the original depth + UAV combination must reproduce the failure");
+                let info = dev.GetResourceAllocationInfo(0, &[pc]);
+                assert!(info.SizeInBytes > 0 && info.SizeInBytes != u64::MAX);
+                let state = pc_resource_state(&converted, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
+                assert_eq!(state, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
+                let mut resource: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &pc, D3D12_RESOURCE_STATES(state as i32), None, &mut resource).expect("converted retail depth resource");
+                assert!(resource.is_some());
+                println!("retail depth {width}x{height}x{array}, format {format}: {} bytes allocated", info.SizeInBytes);
+            }
+            let mut plain_uav = [0u8; 0x38];
+            plain_uav[0x30] = 4;
+            assert_eq!(pc_resource_desc(&plain_uav)[0x30], 4);
+            assert_eq!(pc_resource_state(&plain_uav, 8), 8);
+        }
     }
 
     #[test]

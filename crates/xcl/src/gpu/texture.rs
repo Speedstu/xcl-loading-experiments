@@ -1,3 +1,4 @@
+// Experimental changes: Speedstu, 2026-11-23/24. See LOADING-TRIAL.md for provenance.
 //! Console textures from console memory → PC textures. On the console a texture is the
 //! memory a T# points at: the title writes it already tiled (GFX10 swizzle, mip chain and
 //! slices as addrlib lays them out – its archives store textures that way) and samples it
@@ -195,7 +196,7 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
     let staging = record_upload(dev, &list, res, subs, before, after)?;
     list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    crate::hle::d3d12x::queue_order::execute_native(queue,&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
     let r = wait(dev, queue);
     drop(staging);
     r
@@ -218,7 +219,7 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         }
     }
     list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    crate::hle::d3d12x::queue_order::execute_native(queue,&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
     wait(dev, queue)?;
     drop(staging);
     Ok(failed)
@@ -227,6 +228,12 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
 /// Record the copy of `subs` into `res` on `list` (barriers from `before` and back to `after`);
 /// the staging buffer returned must live until the list has run.
 pub unsafe fn record_upload(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, subs: &[Subresource], before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> Result<ID3D12Resource, String> {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *TRACE.get_or_init(|| std::env::var_os("XCL_TRACE_TEXTURE_UPLOADS").is_some()) {
+        let d = res.GetDesc();
+        crate::xlog_info!("texture upload begin: resource {:p}, {}x{}x{}, format {}, mips {}, samples {}, flags {:#x}, layout {}, {} subresources, states {:#x}->{:#x}", windows::core::Interface::as_raw(res), d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels, d.SampleDesc.Count, d.Flags.0, d.Layout.0, subs.len(), before.0, after.0);
+        crate::log::flush();
+    }
     validate_subresources(subs)?;
     let rd = res.GetDesc();
     let n = subs.len();
@@ -283,7 +290,7 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
     let copy_error = |e| format!("texture copy: {e}");
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
         .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
-    queue.Signal(&fence, 1).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    crate::hle::d3d12x::queue_order::signal(queue, &fence, 1).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
     fence::wait(&fence, 1, dev, None, 10_000).map_err(copy_error)
 }
 
